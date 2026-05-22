@@ -696,10 +696,7 @@ func (r *renderer) decl(node ast.Node) string {
 		c.Doc = nil
 		node = &c
 	}
-	var buf bytes.Buffer
-	cfg := &printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 4}
-	_ = cfg.Fprint(&buf, r.fset, node)
-	return buf.String()
+	return r.print(node)
 }
 
 // typeDecl renders a type declaration. When expand is false the body
@@ -749,18 +746,24 @@ func (r *renderer) oneLineType(t ast.Expr) string {
 
 // exprText pretty-prints an AST expression node as Go source.
 func (r *renderer) exprText(node ast.Node) string {
-	var buf bytes.Buffer
-	cfg := &printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 4}
-	_ = cfg.Fprint(&buf, r.fset, node)
-	return buf.String()
+	return r.print(node)
 }
 
 // source pretty-prints a declaration with its full body and any
 // attached doc comments. It relies on the AST having been parsed
 // (and preserved) with doc comments intact.
 func (r *renderer) source(node ast.Node) string {
+	return r.print(node)
+}
+
+// print pretty-prints node using glodoc's house printer configuration:
+// spaces for both indentation and alignment (no tabs in output) at four
+// spaces per level. Avoiding tabs keeps the rendered code from
+// drifting visually when terminals or pagers expand tabs differently
+// than the markdown renderer expects.
+func (r *renderer) print(node ast.Node) string {
 	var buf bytes.Buffer
-	cfg := &printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 4}
+	cfg := &printer.Config{Mode: printer.UseSpaces, Tabwidth: 4}
 	_ = cfg.Fprint(&buf, r.fset, node)
 	return buf.String()
 }
