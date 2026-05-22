@@ -1,0 +1,218 @@
+// Package tui provides the interactive terminal UI for glodoc.
+//
+// The interface mirrors glow's: a list of available packages in the
+// current module, and a viewport that displays a selected package's
+// rendered documentation. Enter opens a package, Esc returns to the
+// list, and q (or Ctrl+C) quits.
+package tui
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/tools/go/packages"
+
+	"ily.dev/glodoc/internal/render"
+	"ily.dev/glodoc/internal/resolve"
+)
+
+// Run starts the TUI, listing the packages of the module rooted at the
+// current working directory. It blocks until the user quits.
+func Run() error {
+	items, err := discoverPackages()
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return fmt.Errorf("no Go packages found in the current module")
+	}
+	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
+	l.Title = "glodoc"
+	l.SetShowStatusBar(true)
+	l.SetFilteringEnabled(true)
+
+	m := model{
+		view:     viewList,
+		list:     l,
+		viewport: viewport.New(0, 0),
+	}
+	_, err = tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
+	return err
+}
+
+// view identifies which surface is currently presented.
+type view int
+
+const (
+	viewList view = iota
+	viewDoc
+)
+
+type model struct {
+	view     view
+	list     list.Model
+	viewport viewport.Model
+	width    int
+	height   int
+	err      error
+	current  string // package path currently rendered in the viewport
+}
+
+// pkgItem is a list entry describing one module package.
+type pkgItem struct {
+	path     string
+	name     string
+	synopsis string
+}
+
+func (p pkgItem) Title() string       { return p.path }
+func (p pkgItem) Description() string { return p.synopsis }
+func (p pkgItem) FilterValue() string { return p.path }
+
+func (m model) Init() tea.Cmd { return nil }
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		hf, vf := docFrame.GetFrameSize()
+		m.list.SetSize(msg.Width-hf, msg.Height-vf)
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 1
+		return m, nil
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "q":
+			if m.view == viewList && !m.list.SettingFilter() {
+				return m, tea.Quit
+			}
+			if m.view == viewDoc {
+				return m, tea.Quit
+			}
+		case "esc":
+			if m.view == viewDoc {
+				m.view = viewList
+				return m, nil
+			}
+		case "enter":
+			if m.view == viewList {
+				if it, ok := m.list.SelectedItem().(pkgItem); ok {
+					content, err := renderPackage(it.path, m.viewport.Width)
+					if err != nil {
+						m.err = err
+						return m, nil
+					}
+					m.viewport.SetContent(content)
+					m.viewport.GotoTop()
+					m.current = it.path
+					m.view = viewDoc
+					return m, nil
+				}
+			}
+		}
+	}
+
+	var cmd tea.Cmd
+	switch m.view {
+	case viewList:
+		m.list, cmd = m.list.Update(msg)
+	case viewDoc:
+		m.viewport, cmd = m.viewport.Update(msg)
+	}
+	return m, cmd
+}
+
+func (m model) View() string {
+	if m.err != nil {
+		return errorStyle.Render("error: "+m.err.Error()) + "\npress q to quit"
+	}
+	switch m.view {
+	case viewList:
+		return docFrame.Render(m.list.View())
+	case viewDoc:
+		footer := footerStyle.Render(fmt.Sprintf(" %s  ·  esc: list  ·  q: quit ", m.current))
+		return m.viewport.View() + "\n" + footer
+	}
+	return ""
+}
+
+// discoverPackages enumerates the packages of the module rooted at the
+// current working directory and returns them as list items.
+func discoverPackages() ([]list.Item, error) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax,
+	}
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		return nil, err
+	}
+	var items []list.Item
+	for _, p := range pkgs {
+		if p.Name == "" {
+			continue
+		}
+		items = append(items, pkgItem{
+			path:     p.PkgPath,
+			name:     p.Name,
+			synopsis: synopsisOf(p),
+		})
+	}
+	return items, nil
+}
+
+// synopsisOf extracts a one-line synopsis from the leading doc comment
+// of any file in the package. An empty string is returned when no doc
+// comment is present.
+func synopsisOf(p *packages.Package) string {
+	for _, f := range p.Syntax {
+		if f.Doc == nil {
+			continue
+		}
+		text := strings.TrimSpace(f.Doc.Text())
+		if text == "" {
+			continue
+		}
+		if i := strings.Index(text, "\n\n"); i >= 0 {
+			text = text[:i]
+		}
+		return strings.Join(strings.Fields(text), " ")
+	}
+	return ""
+}
+
+// renderPackage resolves the package at pkgPath and returns its
+// markdown rendered through glamour at the given width.
+func renderPackage(pkgPath string, width int) (string, error) {
+	t, err := resolve.Resolve([]string{pkgPath})
+	if err != nil {
+		return "", err
+	}
+	md := render.Package(t.Pkg, t.Fset, t.Symbol, t.Method)
+	wrap := width
+	if wrap <= 0 || wrap > 100 {
+		wrap = 100
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(wrap),
+	)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	return r.Render(md)
+}
+
+var (
+	docFrame    = lipgloss.NewStyle().Margin(1, 2)
+	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	footerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Reverse(true)
+)
