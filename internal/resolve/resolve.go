@@ -142,6 +142,19 @@ func (r *resolver) load(pkgPath, sym, method string) (*Target, error) {
 	return r.fromBuildPackage(bpkg, sym, method)
 }
 
+// LoadDir loads documentation for the package at the given filesystem
+// directory, bypassing import-path resolution. It is intended for
+// callers (such as the TUI) that already know the package's location
+// on disk and want to avoid the cost of consulting the module graph.
+func LoadDir(dir string, opts Options) (*Target, error) {
+	r := resolver{opts: opts}
+	bpkg, err := build.Default.ImportDir(dir, build.ImportComment)
+	if err != nil {
+		return nil, err
+	}
+	return r.fromBuildPackage(bpkg, "", "")
+}
+
 // fromBuildPackage parses the Go source of bpkg and assembles a Target.
 func (r *resolver) fromBuildPackage(bpkg *build.Package, sym, method string) (*Target, error) {
 	fset := token.NewFileSet()

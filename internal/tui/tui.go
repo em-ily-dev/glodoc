@@ -70,6 +70,7 @@ type model struct {
 // pkgItem is a list entry describing one module package.
 type pkgItem struct {
 	path     string
+	dir      string
 	synopsis string
 }
 
@@ -108,7 +109,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.view == viewList {
 				if it, ok := m.list.SelectedItem().(pkgItem); ok {
-					content, err := renderPackage(it.path, m.viewport.Width)
+					content, err := renderPackage(it, m.viewport.Width)
 					if err != nil {
 						m.err = err
 						return m, nil
@@ -155,6 +156,7 @@ func discoverPackages() ([]list.Item, error) {
 	for _, e := range entries {
 		items = append(items, pkgItem{
 			path:     e.ImportPath,
+			dir:      e.Dir,
 			synopsis: synopsisOf(e.Dir),
 		})
 	}
@@ -183,10 +185,12 @@ func synopsisOf(dir string) string {
 	return ""
 }
 
-// renderPackage resolves the package at pkgPath and returns its
-// markdown rendered through glamour at the given width.
-func renderPackage(pkgPath string, width int) (string, error) {
-	t, err := resolve.Resolve([]string{pkgPath}, resolve.Options{})
+// renderPackage loads the documentation for the package at it.dir and
+// returns it rendered through glamour at the given width. Loading from
+// the directory directly avoids the cost of re-resolving an import
+// path through the module graph.
+func renderPackage(it pkgItem, width int) (string, error) {
+	t, err := resolve.LoadDir(it.dir, resolve.Options{})
 	if err != nil {
 		return "", err
 	}
