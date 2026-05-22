@@ -176,8 +176,15 @@ func (r *resolver) parseArgs(args []string) (*Target, error) {
 }
 
 // fromDir parses the package rooted at dir and returns a Target.
+// The directory is resolved to an absolute path before lookup so
+// go/build can recognize it as GOROOT/src or a module member and set
+// the package's ImportPath accordingly.
 func (r *resolver) fromDir(dir, sym, method string) (*Target, error) {
-	bpkg, err := build.Default.ImportDir(dir, build.ImportComment)
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	bpkg, err := build.Default.ImportDir(abs, build.ImportComment)
 	if err != nil {
 		return nil, err
 	}
