@@ -357,6 +357,20 @@ func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
 			return
 		}
 	}
+	// Constructors are grouped under their return type's Funcs; check
+	// them too so "pkg.New" finds template.New, fmt.Errorf, etc.
+	for _, t := range r.pkg.Types {
+		for _, f := range t.Funcs {
+			if eq(sym)(f.Name) {
+				if r.opts.Src {
+					r.functionSrc(b, f)
+				} else {
+					r.functionFull(b, f, 2)
+				}
+				return
+			}
+		}
+	}
 	for _, t := range r.pkg.Types {
 		if !eq(sym)(t.Name) {
 			continue

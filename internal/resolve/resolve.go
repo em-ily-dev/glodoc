@@ -1,11 +1,13 @@
 // Package resolve interprets glodoc command-line arguments as a
-// documentation rendering target.
+// documentation rendering target, following the algorithm used by
+// "go doc".
 //
-// The argument grammar mirrors "go doc": zero arguments resolves to the
-// current directory, one argument is tried in turn as a package path, a
-// "pkg.symbol", a "pkg.type.method", a fuzzy match by final path
-// segment, and finally as a symbol of the current directory's package;
-// two arguments are a package followed by "symbol" or "symbol.method".
+// The argument grammar mirrors go doc: zero arguments resolves to the
+// current directory; one argument is tried as a complete package path,
+// then (if the first letter is upper case) as a symbol in the current
+// directory, then progressively shorter "<pkg>.<sym>" splits, with a
+// fuzzy lookup by trailing path segment as the fallback at each step;
+// two arguments are a package followed by "<sym>[.<methodOrField>]".
 //
 // Package lookup is performed via go/build, the same mechanism go doc
 // uses, so paths are resolved without the cost of dependency analysis.
@@ -19,8 +21,8 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"ily.dev/glodoc/internal/modindex"
@@ -50,96 +52,11 @@ type Target struct {
 	Method string
 }
 
-// Resolve interprets args (0, 1, or 2 elements) as a rendering target.
-//
-// With zero arguments, the current directory is used. With one argument,
-// the shapes "<pkg>", "<pkg>.<sym>", and "<pkg>.<type>.<method>" are tried
-// in turn, followed by a fuzzy match against known packages by final path
-// segment and finally as a symbol of the current directory's package.
-// With two arguments, the first is the package and the second is
-// "<sym>" or "<sym>.<method>".
+// Resolve interprets args (0, 1, or 2 elements) as a rendering target,
+// following go doc's parseArgs algorithm.
 func Resolve(args []string, opts Options) (*Target, error) {
 	r := resolver{opts: opts}
-	switch len(args) {
-	case 0:
-		return r.load(".", "", "")
-	case 1:
-		return r.resolveOne(args[0])
-	case 2:
-		sym, method := splitSym(args[1])
-		return r.loadAny(args[0], sym, method)
-	}
-	return nil, fmt.Errorf("expected 0, 1, or 2 arguments, got %d", len(args))
-}
-
-// resolver carries the loading options through the resolution attempts.
-type resolver struct {
-	opts Options
-}
-
-// resolveOne resolves a single positional argument by trying it in
-// progressively looser forms.
-func (r *resolver) resolveOne(arg string) (*Target, error) {
-	if t, err := r.loadAny(arg, "", ""); err == nil {
-		return t, nil
-	}
-	if i := strings.LastIndex(arg, "."); i > 0 {
-		if t, err := r.loadAny(arg[:i], arg[i+1:], ""); err == nil {
-			return t, nil
-		}
-		if j := strings.LastIndex(arg[:i], "."); j > 0 {
-			if t, err := r.loadAny(arg[:j], arg[j+1:i], arg[i+1:]); err == nil {
-				return t, nil
-			}
-		}
-	}
-	if t, err := r.fuzzy(arg); err == nil {
-		return t, nil
-	}
-	if t, err := r.currentDirSymbol(arg); err == nil {
-		return t, nil
-	}
-	return nil, fmt.Errorf("could not resolve %q", arg)
-}
-
-// loadAny tries pkgPath as given, then with a "./" prefix if it isn't
-// already a relative or absolute path. This lets bare paths like
-// "internal/foo" resolve as filesystem-relative when no import path of
-// that name exists.
-func (r *resolver) loadAny(pkgPath, sym, method string) (*Target, error) {
-	if t, err := r.load(pkgPath, sym, method); err == nil {
-		return t, nil
-	} else if isPath(pkgPath) {
-		return nil, err
-	}
-	return r.load("./"+pkgPath, sym, method)
-}
-
-// isPath reports whether s already looks like a filesystem path (so we
-// shouldn't try prepending "./").
-func isPath(s string) bool {
-	return strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") || strings.HasPrefix(s, "/")
-}
-
-// splitSym splits "sym" or "sym.method" into its parts.
-func splitSym(s string) (sym, method string) {
-	sym, method, _ = strings.Cut(s, ".")
-	return sym, method
-}
-
-// load resolves pkgPath via go/build, parses the package's Go files
-// (including test files, so examples attach to their subjects), and
-// returns a Target.
-func (r *resolver) load(pkgPath, sym, method string) (*Target, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
-	bpkg, err := build.Default.Import(pkgPath, cwd, build.ImportComment)
-	if err != nil {
-		return nil, err
-	}
-	return r.fromBuildPackage(bpkg, sym, method)
+	return r.parseArgs(args)
 }
 
 // LoadDir loads documentation for the package at the given filesystem
@@ -153,6 +70,118 @@ func LoadDir(dir string, opts Options) (*Target, error) {
 		return nil, err
 	}
 	return r.fromBuildPackage(bpkg, "", "")
+}
+
+// resolver carries the loading options through the resolution attempts.
+type resolver struct {
+	opts Options
+}
+
+// parseArgs is a port of cmd/go/internal/doc.parseArgs. It returns the
+// first target found by walking the same sequence of fallbacks go doc
+// itself uses.
+func (r *resolver) parseArgs(args []string) (*Target, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	if len(args) == 0 {
+		return r.fromDir(wd, "", "")
+	}
+
+	arg := args[0]
+	// Convert a leading "./" or "../" to an absolute path so we don't
+	// confuse a local "./errors" with the standard "errors" package.
+	if isDotSlash(arg) {
+		arg = filepath.Join(wd, arg)
+	}
+
+	switch len(args) {
+	case 2:
+		sym, method := splitSym(args[1])
+		if bpkg, err := build.Default.Import(args[0], wd, build.ImportComment); err == nil {
+			return r.fromBuildPackage(bpkg, sym, method)
+		}
+		if t, err := r.fuzzy(arg, sym, method); err == nil {
+			return t, nil
+		}
+		return nil, fmt.Errorf("no such package: %s", args[0])
+	case 1:
+		// fall through to the one-arg logic below
+	default:
+		return nil, fmt.Errorf("expected at most 2 arguments, got %d", len(args))
+	}
+
+	// One-arg case. Try the arg as a complete package path first;
+	// this short-circuits the period splits below so a package path
+	// that contains another package path as a prefix can't be
+	// confused for "<prefix>.<rest>".
+	var importErr error
+	if filepath.IsAbs(arg) {
+		bpkg, err := build.Default.ImportDir(arg, build.ImportComment)
+		if err == nil {
+			return r.fromBuildPackage(bpkg, "", "")
+		}
+		importErr = err
+	} else {
+		bpkg, err := build.Default.Import(arg, wd, build.ImportComment)
+		if err == nil {
+			return r.fromBuildPackage(bpkg, "", "")
+		}
+		importErr = err
+	}
+
+	// If arg starts with an upper-case letter and has no slashes, it
+	// can only be a symbol in the current directory. This kills the
+	// problem of case-insensitive filesystems matching an upper-case
+	// name as a package name.
+	if !strings.ContainsAny(arg, `/\`) && token.IsExported(arg) {
+		sym, method := splitSym(arg)
+		if t, err := r.fromDir(".", sym, method); err == nil {
+			return t, nil
+		}
+	}
+
+	// Try period splits after the last slash, looking for "<pkg>.<sym>".
+	slash := strings.LastIndex(arg, "/")
+	period := -1
+	for start := slash + 1; start < len(arg); start = period + 1 {
+		rel := strings.Index(arg[start:], ".")
+		var rest string
+		if rel < 0 {
+			period = len(arg)
+		} else {
+			period = start + rel
+			rest = arg[period+1:]
+		}
+		pkgPath := arg[:period]
+		sym, method := splitSym(rest)
+		if bpkg, err := build.Default.Import(pkgPath, wd, build.ImportComment); err == nil {
+			return r.fromBuildPackage(bpkg, sym, method)
+		}
+		if t, err := r.fuzzy(pkgPath, sym, method); err == nil {
+			return t, nil
+		}
+	}
+
+	// If the original arg had a slash, no match is fatal: it can only
+	// have been a package path.
+	if slash >= 0 {
+		return nil, importErr
+	}
+
+	// Last resort: assume a symbol in the current directory.
+	sym, method := splitSym(arg)
+	return r.fromDir(".", sym, method)
+}
+
+// fromDir parses the package rooted at dir and returns a Target.
+func (r *resolver) fromDir(dir, sym, method string) (*Target, error) {
+	bpkg, err := build.Default.ImportDir(dir, build.ImportComment)
+	if err != nil {
+		return nil, err
+	}
+	return r.fromBuildPackage(bpkg, sym, method)
 }
 
 // fromBuildPackage parses the Go source of bpkg and assembles a Target.
@@ -183,8 +212,6 @@ func (r *resolver) fromBuildPackage(bpkg *build.Package, sym, method string) (*T
 	}
 	importPath := bpkg.ImportPath
 	if importPath == "" || importPath == "." {
-		// build.Import doesn't always set ImportPath for filesystem
-		// targets; fall back to the directory name for display.
 		importPath = filepath.Base(bpkg.Dir)
 	}
 	docPkg, err := doc.NewFromFiles(fset, files, importPath, r.docMode()...)
@@ -203,8 +230,6 @@ func (r *resolver) docMode() []any {
 		mode |= doc.AllDecls | doc.AllMethods
 	}
 	if r.opts.Source {
-		// PreserveAST keeps function bodies and unmodified declarations
-		// so the renderer can emit the original Go source.
 		mode |= doc.PreserveAST
 	}
 	if mode == 0 {
@@ -213,66 +238,46 @@ func (r *resolver) docMode() []any {
 	return []any{mode}
 }
 
-// fuzzy searches indexed package directories for one whose final path
-// segment matches name and returns its rendering target.
-func (r *resolver) fuzzy(name string) (*Target, error) {
-	hits := modindex.Default().FindByBase(name)
-	if len(hits) == 0 {
+// fuzzy searches indexed package directories for one whose import
+// path is or ends with name, matching go doc's findNextPackage. It
+// returns the first hit; an upper-case name returns no match because
+// it cannot be a package name.
+func (r *resolver) fuzzy(name, sym, method string) (*Target, error) {
+	if name == "" || token.IsExported(name) {
 		return nil, fmt.Errorf("no package matching %q", name)
 	}
-	bpkg, err := build.Default.ImportDir(hits[0].Dir, build.ImportComment)
-	if err != nil {
-		return nil, err
+	name = path.Clean(name)
+	suffix := "/" + name
+	for _, e := range modindex.Default().All() {
+		if e.ImportPath == name || strings.HasSuffix(e.ImportPath, suffix) {
+			bpkg, err := build.Default.ImportDir(e.Dir, build.ImportComment)
+			if err != nil {
+				continue
+			}
+			if bpkg.ImportPath == "" || bpkg.ImportPath == "." {
+				bpkg.ImportPath = e.ImportPath
+			}
+			return r.fromBuildPackage(bpkg, sym, method)
+		}
 	}
-	if bpkg.ImportPath == "" {
-		bpkg.ImportPath = hits[0].ImportPath
-	}
-	return r.fromBuildPackage(bpkg, "", "")
+	return nil, fmt.Errorf("no package matching %q", name)
 }
 
-// currentDirSymbol tries to resolve arg as a symbol (or "sym.method")
-// in the package of the current working directory. It succeeds only
-// when the symbol is actually present, so callers can chain this after
-// other resolution attempts without falsely matching every input.
-func (r *resolver) currentDirSymbol(arg string) (*Target, error) {
-	t, err := r.load(".", "", "")
-	if err != nil {
-		return nil, err
-	}
-	sym, method := splitSym(arg)
-	if !packageHasSymbol(t.Pkg, sym) {
-		return nil, fmt.Errorf("no symbol %q in current package", sym)
-	}
-	t.Symbol = sym
-	t.Method = method
-	return t, nil
+// splitSym splits "sym" or "sym.method" into its parts.
+func splitSym(s string) (sym, method string) {
+	sym, method, _ = strings.Cut(s, ".")
+	return sym, method
 }
 
-// packageHasSymbol reports whether the package exposes a top-level
-// symbol with the given name. Matching is case-insensitive because
-// case-sensitivity is a rendering-time concern controlled by -c.
-func packageHasSymbol(pkg *doc.Package, name string) bool {
-	if name == "" {
-		return false
+// isDotSlash reports whether s begins with a reference to the local
+// "." or ".." directory. It matches the eponymous helper in
+// cmd/go/internal/doc/doc.go.
+func isDotSlash(s string) bool {
+	if s == "." || s == ".." {
+		return true
 	}
-	eq := func(s string) bool { return strings.EqualFold(s, name) }
-	for _, c := range pkg.Consts {
-		if slices.ContainsFunc(c.Names, eq) {
-			return true
-		}
-	}
-	for _, v := range pkg.Vars {
-		if slices.ContainsFunc(v.Names, eq) {
-			return true
-		}
-	}
-	for _, f := range pkg.Funcs {
-		if eq(f.Name) {
-			return true
-		}
-	}
-	for _, t := range pkg.Types {
-		if eq(t.Name) {
+	for _, prefix := range []string{"./", "../", `.\`, `..\`} {
+		if strings.HasPrefix(s, prefix) {
 			return true
 		}
 	}
