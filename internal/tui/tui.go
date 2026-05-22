@@ -23,6 +23,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"ily.dev/glodoc/internal/modindex"
 	"ily.dev/glodoc/internal/render"
@@ -74,9 +75,25 @@ func Run() error {
 		view:     viewList,
 		list:     l,
 		viewport: viewport.New(0, 0),
+		style:    detectStyle(),
 	}
 	_, err = tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
 	return err
+}
+
+// detectStyle probes the terminal for its background color and returns
+// the glamour style name to use ("dark" or "light"). It must be called
+// before bubble tea takes over input handling, because the OSC response
+// to the background-color query is otherwise consumed by bubble tea's
+// reader and termenv blocks for a 5-second timeout.
+func detectStyle() string {
+	t0 := time.Now()
+	dark := termenv.NewOutput(os.Stdout).HasDarkBackground()
+	tracef("detectStyle dark=%v in %s", dark, ms(time.Since(t0)))
+	if dark {
+		return "dark"
+	}
+	return "light"
 }
 
 // view identifies which surface is currently presented.
@@ -95,6 +112,42 @@ type model struct {
 	height   int
 	err      error
 	current  string // package path currently rendered in the viewport
+
+	// style is the glamour style name ("dark" or "light") resolved by
+	// detectStyle once before bubble tea took over the terminal; it is
+	// constant for the life of the session.
+	style string
+	// renderer is the cached glamour TermRenderer. It is created
+	// lazily on the first render and recreated only when the viewport
+	// width changes.
+	renderer      *glamour.TermRenderer
+	rendererWidth int
+}
+
+// ensureRenderer makes m.renderer ready for the given width, creating
+// or rebuilding it only when necessary. The cached renderer skips the
+// per-call termenv probe that WithAutoStyle would do, which otherwise
+// stalls for OSCTimeout (5s) whenever bubble tea's input reader
+// consumes the probe response.
+func (m *model) ensureRenderer(width int) error {
+	if m.renderer != nil && m.rendererWidth == width {
+		return nil
+	}
+	if m.renderer != nil {
+		m.renderer.Close()
+	}
+	t0 := time.Now()
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStandardStyle(m.style),
+		glamour.WithWordWrap(width),
+	)
+	tracef("  ensureRenderer  %s (style=%s width=%d)", ms(time.Since(t0)), m.style, width)
+	if err != nil {
+		return err
+	}
+	m.renderer = r
+	m.rendererWidth = width
+	return nil
 }
 
 // pkgItem is a list entry describing one module package.
@@ -140,7 +193,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == viewList {
 				if it, ok := m.list.SelectedItem().(pkgItem); ok {
 					tracef("enter pressed for %s", it.path)
-					content, err := renderPackage(it, m.viewport.Width)
+					content, err := m.renderPackage(it)
 					if err != nil {
 						m.err = err
 						return m, nil
@@ -219,10 +272,12 @@ func synopsisOf(dir string) string {
 }
 
 // renderPackage loads the documentation for the package at it.dir and
-// returns it rendered through glamour at the given width. Loading from
-// the directory directly avoids the cost of re-resolving an import
-// path through the module graph.
-func renderPackage(it pkgItem, width int) (string, error) {
+// returns it rendered through glamour at the current viewport width.
+// Loading from the directory directly avoids the cost of re-resolving
+// an import path through the module graph; the cached glamour
+// renderer avoids the per-call termenv probe that would otherwise
+// stall for OSCTimeout when bubble tea consumes the probe response.
+func (m *model) renderPackage(it pkgItem) (string, error) {
 	total := time.Now()
 	tracef("renderPackage(%s) begin; heap_before=%s", it.path, heapSize())
 	defer func() {
@@ -240,24 +295,16 @@ func renderPackage(it pkgItem, width int) (string, error) {
 	md := render.Package(t.Pkg, t.Fset, t.Symbol, t.Method, render.Options{All: true})
 	tracef("  render.Package  %s (%d bytes markdown)", ms(time.Since(stage)), len(md))
 
-	wrap := width
+	wrap := m.viewport.Width
 	if wrap <= 0 || wrap > 100 {
 		wrap = 100
 	}
-
-	stage = time.Now()
-	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(wrap),
-	)
-	tracef("  glamour.New     %s", ms(time.Since(stage)))
-	if err != nil {
+	if err := m.ensureRenderer(wrap); err != nil {
 		return "", err
 	}
-	defer r.Close()
 
 	stage = time.Now()
-	out, err := r.Render(md)
+	out, err := m.renderer.Render(md)
 	tracef("  glamour.Render  %s (%d bytes ANSI)", ms(time.Since(stage)), len(out))
 	return out, err
 }
