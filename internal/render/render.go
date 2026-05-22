@@ -21,6 +21,8 @@ import (
 	"go/token"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Options controls the structure and verbosity of rendered output.
@@ -334,21 +336,21 @@ func indent(s, prefix string) string {
 // to a method or field. It always shows the symbol with its full
 // documentation; -all is implied when a specific symbol is requested.
 func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
-	eq := r.eq()
+	match := r.matches(sym)
 	for _, c := range r.pkg.Consts {
-		if slices.ContainsFunc(c.Names, eq(sym)) {
+		if slices.ContainsFunc(c.Names, match) {
 			r.values(b, []*doc.Value{c}, true)
 			return
 		}
 	}
 	for _, v := range r.pkg.Vars {
-		if slices.ContainsFunc(v.Names, eq(sym)) {
+		if slices.ContainsFunc(v.Names, match) {
 			r.values(b, []*doc.Value{v}, true)
 			return
 		}
 	}
 	for _, f := range r.pkg.Funcs {
-		if eq(sym)(f.Name) {
+		if match(f.Name) {
 			if r.opts.Src {
 				r.functionSrc(b, f)
 			} else {
@@ -361,7 +363,7 @@ func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
 	// them too so "pkg.New" finds template.New, fmt.Errorf, etc.
 	for _, t := range r.pkg.Types {
 		for _, f := range t.Funcs {
-			if eq(sym)(f.Name) {
+			if match(f.Name) {
 				if r.opts.Src {
 					r.functionSrc(b, f)
 				} else {
@@ -371,8 +373,9 @@ func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
 			}
 		}
 	}
+	matchMethod := r.matches(method)
 	for _, t := range r.pkg.Types {
-		if !eq(sym)(t.Name) {
+		if !match(t.Name) {
 			continue
 		}
 		if method == "" {
@@ -384,7 +387,7 @@ func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
 			return
 		}
 		for _, m := range t.Methods {
-			if eq(method)(m.Name) {
+			if matchMethod(m.Name) {
 				if r.opts.Src {
 					r.functionSrc(b, m)
 				} else {
@@ -403,17 +406,48 @@ func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
 	fmt.Fprintf(b, "_no symbol named %s_\n", sym)
 }
 
-// eq returns a per-target name-equality predicate honoring
-// CaseSensitive. The returned function is curried so it composes
-// neatly with slices.ContainsFunc.
-func (r *renderer) eq() func(target string) func(string) bool {
+// matches returns a predicate that reports whether a program-defined
+// name satisfies the user-provided query. It honors CaseSensitive and,
+// otherwise, go doc's case-folding rule: lower-case characters in the
+// query match either case in the program name, but upper-case
+// characters must match exactly.
+func (r *renderer) matches(user string) func(program string) bool {
 	if r.opts.CaseSensitive {
-		return func(target string) func(string) bool {
-			return func(s string) bool { return s == target }
-		}
+		return func(program string) bool { return program == user }
 	}
-	return func(target string) func(string) bool {
-		return func(s string) bool { return strings.EqualFold(s, target) }
+	return func(program string) bool { return foldMatch(program, user) }
+}
+
+// foldMatch implements the matching rule used by go doc: each rune of
+// user must equal the corresponding rune of program, or be a lower-case
+// letter whose simple-fold equivalent matches.
+func foldMatch(program, user string) bool {
+	for _, u := range user {
+		if program == "" {
+			return false
+		}
+		p, w := utf8.DecodeRuneInString(program)
+		program = program[w:]
+		if u == p {
+			continue
+		}
+		if unicode.IsLower(u) && simpleFold(u) == simpleFold(p) {
+			continue
+		}
+		return false
+	}
+	return program == ""
+}
+
+// simpleFold returns the minimum rune equivalent to r under Unicode
+// simple case folding.
+func simpleFold(r rune) rune {
+	for {
+		r1 := unicode.SimpleFold(r)
+		if r1 <= r {
+			return r1
+		}
+		r = r1
 	}
 }
 
