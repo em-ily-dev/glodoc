@@ -262,8 +262,33 @@ func dedent(s string) string {
 // prose converts a godoc comment string into markdown, with headings
 // inside the comment starting at the given level.
 func (r *renderer) prose(text string, headingLevel int) string {
-	p := &comment.Printer{HeadingLevel: headingLevel}
+	p := &comment.Printer{
+		HeadingLevel: headingLevel,
+		DocLinkURL:   pkgGoDevURL,
+	}
 	return string(p.Markdown(r.parser.Parse(text)))
+}
+
+// pkgGoDevURL renders a parsed doc link as a pkg.go.dev URL. Links to
+// the current package use a bare fragment so they remain useful when
+// the document is read outside a hyperlinking renderer; cross-package
+// links use the full pkg.go.dev URL.
+func pkgGoDevURL(link *comment.DocLink) string {
+	frag := link.Name
+	if link.Recv != "" {
+		frag = link.Recv + "." + link.Name
+	}
+	if link.ImportPath == "" {
+		if frag == "" {
+			return ""
+		}
+		return "#" + frag
+	}
+	base := "https://pkg.go.dev/" + link.ImportPath
+	if frag == "" {
+		return base
+	}
+	return base + "#" + frag
 }
 
 // decl pretty-prints a declaration node as Go source, stripping bodies
