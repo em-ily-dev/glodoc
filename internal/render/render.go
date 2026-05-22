@@ -35,9 +35,14 @@ type Options struct {
 	// (and surrounding doc comments) preserved. Corresponds to
 	// "go doc -src".
 	Src bool
+	// Unexported renders unexported symbols and fields. The renderer
+	// also consults this option when applying go doc's case-folding
+	// match rule. Corresponds to "go doc -u".
+	Unexported bool
 	// CaseSensitive requires exact-case matching when looking up
-	// symbols. Otherwise symbol names match case-insensitively.
-	// Corresponds to "go doc -c".
+	// symbols. Otherwise lowercase characters in the query match any
+	// case while uppercase characters match exactly, following the
+	// matching rule used by go doc. Corresponds to "go doc -c".
 	CaseSensitive bool
 	// IncludeMain renders the contents of a package main; without it,
 	// only the package overview is shown for main packages.
@@ -98,10 +103,11 @@ func (r *renderer) renderPackage(b *strings.Builder) {
 	}
 }
 
-// defaultPackage matches the layout of "go doc <pkg>": package
-// overview, then constants/variables with full text, then function
-// signatures with their doc comments, then types with collapsed bodies
-// and the funcs that return them, but no methods or examples.
+// defaultPackage matches the layout of "go doc <pkg>": the package
+// overview followed by a single line per top-level symbol. Constants
+// and variables grouped under a type are indented beneath it along
+// with that type's constructors; free functions appear at the top
+// level. No per-symbol doc comments or examples are emitted.
 func (r *renderer) defaultPackage(b *strings.Builder) {
 	if r.pkg.Doc != "" {
 		b.WriteString(r.prose(r.pkg.Doc, 2))
@@ -110,19 +116,151 @@ func (r *renderer) defaultPackage(b *strings.Builder) {
 	if r.pkg.Name == "main" && !r.opts.IncludeMain {
 		return
 	}
-	if len(r.pkg.Consts) > 0 {
-		b.WriteString("## Constants\n\n")
-		r.values(b, r.pkg.Consts, true)
+	r.summaries(b)
+	r.bugs(b)
+}
+
+// summaries writes the one-line summaries for every top-level symbol,
+// matching the format produced by go doc's valueSummary, funcSummary,
+// and typeSummary in its default (non-all, non-short) branch.
+func (r *renderer) summaries(b *strings.Builder) {
+	grouped := r.valuesGroupedByType()
+	constructors := r.typeConstructors()
+
+	b.WriteString("```go\n")
+	for _, c := range r.pkg.Consts {
+		if !grouped[c] {
+			if line := r.valueOneLine(c.Decl); line != "" {
+				b.WriteString(line + "\n")
+			}
+		}
 	}
-	if len(r.pkg.Vars) > 0 {
-		b.WriteString("## Variables\n\n")
-		r.values(b, r.pkg.Vars, true)
+	for _, v := range r.pkg.Vars {
+		if !grouped[v] {
+			if line := r.valueOneLine(v.Decl); line != "" {
+				b.WriteString(line + "\n")
+			}
+		}
 	}
 	for _, f := range r.pkg.Funcs {
-		r.functionDefault(b, f)
+		if !constructors[f] && r.symbolVisible(f.Name) {
+			b.WriteString(r.decl(f.Decl) + "\n")
+		}
 	}
 	for _, t := range r.pkg.Types {
-		r.typeDefault(b, t)
+		if !r.symbolVisible(t.Name) {
+			continue
+		}
+		b.WriteString(r.typeDecl(t.Decl, false) + "\n")
+		for _, c := range t.Consts {
+			if line := r.valueOneLine(c.Decl); line != "" {
+				b.WriteString("    " + line + "\n")
+			}
+		}
+		for _, v := range t.Vars {
+			if line := r.valueOneLine(v.Decl); line != "" {
+				b.WriteString("    " + line + "\n")
+			}
+		}
+		for _, f := range t.Funcs {
+			if r.symbolVisible(f.Name) {
+				b.WriteString("    " + r.decl(f.Decl) + "\n")
+			}
+		}
+	}
+	b.WriteString("```\n")
+}
+
+// valuesGroupedByType returns the set of *doc.Value entries that are
+// attached to a type (so the type summary emits them indented).
+func (r *renderer) valuesGroupedByType() map[*doc.Value]bool {
+	g := map[*doc.Value]bool{}
+	for _, t := range r.pkg.Types {
+		if !r.symbolVisible(t.Name) {
+			continue
+		}
+		for _, c := range t.Consts {
+			g[c] = true
+		}
+		for _, v := range t.Vars {
+			g[v] = true
+		}
+	}
+	return g
+}
+
+// typeConstructors returns the set of *doc.Func entries that are
+// constructors for a type (printed by the type summary, suppressed
+// from the free-function list).
+func (r *renderer) typeConstructors() map[*doc.Func]bool {
+	c := map[*doc.Func]bool{}
+	for _, t := range r.pkg.Types {
+		for _, f := range t.Funcs {
+			c[f] = true
+		}
+	}
+	return c
+}
+
+// symbolVisible reports whether a symbol with the given name should
+// appear in summaries. It honors the Unexported option in the same way
+// "go doc -u" does.
+func (r *renderer) symbolVisible(name string) bool {
+	return r.opts.Unexported || token.IsExported(name)
+}
+
+// valueOneLine renders a const/var GenDecl as a single line in the
+// shape "tok Name[ type][ = value][ ...]", matching the output of
+// go doc's oneLineNode for *ast.GenDecl. A trailing " ..." indicates
+// that the block contains more specs than the one shown.
+func (r *renderer) valueOneLine(decl *ast.GenDecl) string {
+	if len(decl.Specs) == 0 {
+		return ""
+	}
+	trailer := ""
+	if len(decl.Specs) > 1 {
+		trailer = " ..."
+	}
+	// In a const block, the type of one spec can carry over to the
+	// next via iota; track it as we iterate so we can attribute it
+	// to the first exported spec we choose to render.
+	var typ string
+	for i, spec := range decl.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		if vs.Type != nil {
+			typ = " " + r.exprText(vs.Type)
+		} else if len(vs.Values) > 0 {
+			typ = ""
+		}
+		if !r.symbolVisible(vs.Names[0].Name) {
+			continue
+		}
+		val := ""
+		if i < len(vs.Values) && vs.Values[i] != nil {
+			val = " = " + r.exprText(vs.Values[i])
+		} else if len(vs.Values) > 0 && vs.Values[0] != nil {
+			val = " = " + r.exprText(vs.Values[0])
+		}
+		return fmt.Sprintf("%s %s%s%s%s", decl.Tok, vs.Names[0], typ, val, trailer)
+	}
+	return ""
+}
+
+// bugs prints package-level BUG notes after the summary, matching the
+// trailing section produced by "go doc <pkg>".
+func (r *renderer) bugs(b *strings.Builder) {
+	notes := r.pkg.Notes["BUG"]
+	if len(notes) == 0 {
+		return
+	}
+	b.WriteString("\n## Bugs\n\n")
+	for _, n := range notes {
+		b.WriteString("- ")
+		b.WriteString(strings.TrimSpace(n.Body))
+		b.WriteString("\n")
 	}
 }
 
@@ -279,18 +417,6 @@ func (r *renderer) values(b *strings.Builder, vs []*doc.Value, withDoc bool) {
 	}
 }
 
-// functionDefault renders a free function in the default package view:
-// signature, then its doc comment.
-func (r *renderer) functionDefault(b *strings.Builder, f *doc.Func) {
-	fmt.Fprintf(b, "## func %s\n\n", funcHeading(f))
-	b.WriteString(codeBlock(r.decl(f.Decl)))
-	b.WriteString("\n")
-	if f.Doc != "" {
-		b.WriteString(r.prose(f.Doc, 3))
-		b.WriteString("\n")
-	}
-}
-
 // functionFull renders a function in the all/symbol view: signature,
 // doc comment, and any attached examples.
 func (r *renderer) functionFull(b *strings.Builder, f *doc.Func, headingLevel int) {
@@ -310,34 +436,6 @@ func (r *renderer) functionSrc(b *strings.Builder, f *doc.Func) {
 	fmt.Fprintf(b, "## func %s\n\n", funcHeading(f))
 	b.WriteString(codeBlock(r.source(f.Decl)))
 	b.WriteString("\n")
-}
-
-// typeDefault renders a type in the default package view: type
-// declaration with collapsed body (for structs/interfaces), the doc
-// comment, and the constructor functions that return it.
-func (r *renderer) typeDefault(b *strings.Builder, t *doc.Type) {
-	fmt.Fprintf(b, "## type %s\n\n", t.Name)
-	b.WriteString(codeBlock(r.typeDecl(t.Decl, false)))
-	b.WriteString("\n")
-	if t.Doc != "" {
-		b.WriteString(r.prose(t.Doc, 3))
-		b.WriteString("\n")
-	}
-	if len(t.Consts) > 0 {
-		r.values(b, t.Consts, true)
-	}
-	if len(t.Vars) > 0 {
-		r.values(b, t.Vars, true)
-	}
-	for _, f := range t.Funcs {
-		fmt.Fprintf(b, "### func %s\n\n", f.Name)
-		b.WriteString(codeBlock(r.decl(f.Decl)))
-		b.WriteString("\n")
-		if f.Doc != "" {
-			b.WriteString(r.prose(f.Doc, 4))
-			b.WriteString("\n")
-		}
-	}
 }
 
 // typeFull renders a type with everything: full declaration, doc

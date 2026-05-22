@@ -83,6 +83,7 @@ func renderOnce(args []string) error {
 		All:           *flagAll,
 		Short:         *flagShort,
 		Src:           *flagSrc,
+		Unexported:    *flagU,
 		CaseSensitive: *flagC,
 		IncludeMain:   *flagCmd,
 	})
