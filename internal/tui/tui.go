@@ -8,6 +8,10 @@ package tui
 
 import (
 	"fmt"
+	"go/build"
+	"go/parser"
+	"go/token"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -15,8 +19,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
-	"golang.org/x/tools/go/packages"
 
+	"ily.dev/glodoc/internal/modindex"
 	"ily.dev/glodoc/internal/render"
 	"ily.dev/glodoc/internal/resolve"
 )
@@ -66,7 +70,6 @@ type model struct {
 // pkgItem is a list entry describing one module package.
 type pkgItem struct {
 	path     string
-	name     string
 	synopsis string
 }
 
@@ -147,39 +150,31 @@ func (m model) View() string {
 // discoverPackages enumerates the packages of the module rooted at the
 // current working directory and returns them as list items.
 func discoverPackages() ([]list.Item, error) {
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax,
-	}
-	pkgs, err := packages.Load(cfg, "./...")
-	if err != nil {
-		return nil, err
-	}
-	var items []list.Item
-	for _, p := range pkgs {
-		if p.Name == "" {
-			continue
-		}
+	entries := modindex.Default().Module()
+	items := make([]list.Item, 0, len(entries))
+	for _, e := range entries {
 		items = append(items, pkgItem{
-			path:     p.PkgPath,
-			name:     p.Name,
-			synopsis: synopsisOf(p),
+			path:     e.ImportPath,
+			synopsis: synopsisOf(e.Dir),
 		})
 	}
 	return items, nil
 }
 
-// synopsisOf extracts a one-line synopsis from the leading doc comment
-// of any file in the package. An empty string is returned when no doc
-// comment is present.
-func synopsisOf(p *packages.Package) string {
-	for _, f := range p.Syntax {
-		if f.Doc == nil {
+// synopsisOf returns the one-line synopsis of the package at dir. It
+// parses just enough of the source to read the leading doc comment.
+func synopsisOf(dir string) string {
+	bpkg, err := build.Default.ImportDir(dir, build.ImportComment)
+	if err != nil || len(bpkg.GoFiles) == 0 {
+		return ""
+	}
+	fset := token.NewFileSet()
+	for _, name := range bpkg.GoFiles {
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.PackageClauseOnly|parser.ParseComments)
+		if err != nil || f.Doc == nil {
 			continue
 		}
 		text := strings.TrimSpace(f.Doc.Text())
-		if text == "" {
-			continue
-		}
 		if i := strings.Index(text, "\n\n"); i >= 0 {
 			text = text[:i]
 		}

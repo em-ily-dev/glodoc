@@ -6,18 +6,23 @@
 // "pkg.symbol", a "pkg.type.method", and finally a fuzzy match by final
 // path segment; two arguments are a package followed by "symbol" or
 // "symbol.method".
+//
+// Package lookup is performed via go/build, the same mechanism go doc
+// uses, so paths are resolved without the cost of dependency analysis.
 package resolve
 
 import (
-	"errors"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/doc"
+	"go/parser"
 	"go/token"
-	"path"
+	"os"
+	"path/filepath"
 	"strings"
 
-	"golang.org/x/tools/go/packages"
+	"ily.dev/glodoc/internal/modindex"
 )
 
 // Target identifies a resolved documentation rendering target.
@@ -100,96 +105,73 @@ func splitSym(s string) (sym, method string) {
 	return sym, method
 }
 
-// load loads the package at pkgPath and returns a Target. The package
-// is loaded along with its test files so that examples can be attached
-// to their documented subjects.
+// load resolves pkgPath via go/build, parses the package's Go files
+// (including test files, so examples attach to their subjects), and
+// returns a Target.
 func load(pkgPath, sym, method string) (*Target, error) {
-	cfg := &packages.Config{
-		Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedModule | packages.NeedImports,
-		Tests: true,
-	}
-	pkgs, err := packages.Load(cfg, pkgPath)
+	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
-	primary, xtest, err := pickVariants(pkgs)
+	bpkg, err := build.Default.Import(pkgPath, cwd, build.ImportComment)
 	if err != nil {
 		return nil, err
 	}
-	files := append([]*ast.File{}, primary.Syntax...)
-	if xtest != nil {
-		files = append(files, xtest.Syntax...)
+	return fromBuildPackage(bpkg, sym, method)
+}
+
+// fromBuildPackage parses the Go source of bpkg and assembles a Target.
+func fromBuildPackage(bpkg *build.Package, sym, method string) (*Target, error) {
+	fset := token.NewFileSet()
+	var files []*ast.File
+	parseList := func(dir string, names []string) error {
+		for _, name := range names {
+			f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.ParseComments)
+			if err != nil {
+				return err
+			}
+			files = append(files, f)
+		}
+		return nil
 	}
-	docPkg, err := doc.NewFromFiles(primary.Fset, files, primary.PkgPath)
+	if err := parseList(bpkg.Dir, bpkg.GoFiles); err != nil {
+		return nil, err
+	}
+	if err := parseList(bpkg.Dir, bpkg.TestGoFiles); err != nil {
+		return nil, err
+	}
+	if err := parseList(bpkg.Dir, bpkg.XTestGoFiles); err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no Go files in %s", bpkg.Dir)
+	}
+	importPath := bpkg.ImportPath
+	if importPath == "" || importPath == "." {
+		// build.Import doesn't always set ImportPath for filesystem
+		// targets; fall back to the directory name for display.
+		importPath = filepath.Base(bpkg.Dir)
+	}
+	docPkg, err := doc.NewFromFiles(fset, files, importPath)
 	if err != nil {
 		return nil, err
 	}
-	return &Target{Pkg: docPkg, Fset: primary.Fset, Symbol: sym, Method: method}, nil
+	return &Target{Pkg: docPkg, Fset: fset, Symbol: sym, Method: method}, nil
 }
 
-// pickVariants selects the package variant that carries the source +
-// internal test files, along with the external _test package if any.
-//
-// packages.Load with Tests:true returns up to three variants: the base
-// package, a "test variant" whose Syntax includes _test.go files, and a
-// synthetic test binary. The external xxx_test package, when present,
-// appears as a separate entry. The test binary (.test) is discarded.
-func pickVariants(pkgs []*packages.Package) (primary, xtest *packages.Package, err error) {
-	var base, withTests *packages.Package
-	for _, p := range pkgs {
-		if strings.HasSuffix(p.ID, ".test") {
-			continue
-		}
-		if strings.HasSuffix(p.Name, "_test") {
-			xtest = p
-			continue
-		}
-		if strings.Contains(p.ID, ".test]") {
-			withTests = p
-		} else {
-			base = p
-		}
-	}
-	primary = withTests
-	if primary == nil {
-		primary = base
-	}
-	if primary == nil || primary.Name == "" {
-		return nil, nil, errors.New("no Go package found")
-	}
-	if perr := firstError(primary); perr != nil {
-		return nil, nil, perr
-	}
-	return primary, xtest, nil
-}
-
-// firstError returns the first non-list error reported for pkg, or nil.
-//
-// "List" errors (kind ListError) come from `go list` itself; we want to
-// surface those as the resolution failure. Other errors usually indicate
-// a parse or type-check problem we can render docs around, so we ignore
-// them here.
-func firstError(pkg *packages.Package) error {
-	for _, e := range pkg.Errors {
-		if e.Kind == packages.ListError {
-			return errors.New(e.Msg)
-		}
-	}
-	return nil
-}
-
-// fuzzy searches known packages (current module and stdlib) for one
-// whose final path segment matches name, returning the first hit.
+// fuzzy searches indexed package directories for one whose final path
+// segment matches name and returns its rendering target.
 func fuzzy(name string) (*Target, error) {
-	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedFiles}
-	pkgs, err := packages.Load(cfg, "./...", "std")
+	hits := modindex.Default().FindByBase(name)
+	if len(hits) == 0 {
+		return nil, fmt.Errorf("no package matching %q", name)
+	}
+	bpkg, err := build.Default.ImportDir(hits[0].Dir, build.ImportComment)
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range pkgs {
-		if path.Base(p.PkgPath) == name {
-			return load(p.PkgPath, "", "")
-		}
+	if bpkg.ImportPath == "" {
+		bpkg.ImportPath = hits[0].ImportPath
 	}
-	return nil, fmt.Errorf("no package matching %q", name)
+	return fromBuildPackage(bpkg, "", "")
 }
