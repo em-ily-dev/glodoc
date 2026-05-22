@@ -31,34 +31,50 @@ import (
 	"ily.dev/glodoc/internal/tui"
 )
 
+// The flag set mirrors "go doc"'s, both in option names and in the
+// exact wording of each flag's description (modulo "-http", which
+// glodoc does not implement). See cmd/go/internal/doc.do for the
+// reference.
 var (
-	flagAll   = flag.Bool("all", false, "Show all the documentation for the package.")
-	flagC     = flag.Bool("c", false, "Respect case when matching symbols.")
-	flagCmd   = flag.Bool("cmd", false, "Treat a command (package main) like a regular package.")
-	flagShort = flag.Bool("short", false, "One-line representation for each symbol.")
-	flagSrc   = flag.Bool("src", false, "Show the full source code for the symbol.")
-	flagU     = flag.Bool("u", false, "Show documentation for unexported as well as exported symbols, methods, and fields.")
+	flagChdir = flag.String("C", "", "change to `dir` before running command")
+	flagAll   = flag.Bool("all", false, "show all documentation for package")
+	flagCase  = flag.Bool("c", false, "symbol matching honors case (paths not affected)")
+	flagCmd   = flag.Bool("cmd", false, "show symbols with package docs even if package is a command")
+	flagShort = flag.Bool("short", false, "one-line representation for each symbol")
+	flagSrc   = flag.Bool("src", false, "show source code for symbol")
+	flagU     = flag.Bool("u", false, "show unexported symbols as well as exported")
 )
 
 func main() {
 	flag.Usage = usage
 	flag.Parse()
+	if *flagChdir != "" {
+		if err := os.Chdir(*flagChdir); err != nil {
+			fmt.Fprintln(os.Stderr, "glodoc:", err)
+			os.Exit(1)
+		}
+	}
 	if err := run(flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "glodoc:", err)
 		os.Exit(1)
 	}
 }
 
+// usage prints the command's help text. The wording mirrors
+// "go doc -h" so users carrying over muscle memory see what they
+// expect; the command name is the only substitution.
 func usage() {
-	fmt.Fprintln(os.Stderr, `Usage of glodoc:
-    glodoc
-    glodoc <pkg>
-    glodoc <sym>[.<methodOrField>]
-    glodoc [<pkg>.]<sym>[.<methodOrField>]
-    glodoc [<pkg>.][<sym>.]<methodOrField>
-    glodoc <pkg> <sym>[.<methodOrField>]
-
-Flags:`)
+	fmt.Fprintln(os.Stderr, "Usage of glodoc:")
+	fmt.Fprintln(os.Stderr, "\tglodoc")
+	fmt.Fprintln(os.Stderr, "\tglodoc <pkg>")
+	fmt.Fprintln(os.Stderr, "\tglodoc <sym>[.<methodOrField>]")
+	fmt.Fprintln(os.Stderr, "\tglodoc [<pkg>.]<sym>[.<methodOrField>]")
+	fmt.Fprintln(os.Stderr, "\tglodoc [<pkg>.][<sym>.]<methodOrField>")
+	fmt.Fprintln(os.Stderr, "\tglodoc <pkg> <sym>[.<methodOrField>]")
+	fmt.Fprintln(os.Stderr, "For more information run")
+	fmt.Fprintln(os.Stderr, "\tgo help doc")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Flags:")
 	flag.PrintDefaults()
 }
 
@@ -84,7 +100,7 @@ func renderOnce(args []string) error {
 		Short:         *flagShort,
 		Src:           *flagSrc,
 		Unexported:    *flagU,
-		CaseSensitive: *flagC,
+		CaseSensitive: *flagCase,
 		IncludeMain:   *flagCmd,
 	})
 	out, err := styled(md)
