@@ -379,10 +379,13 @@ func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
 			continue
 		}
 		if method == "" {
-			if r.opts.Src {
+			switch {
+			case r.opts.Src:
 				r.typeSrc(b, t)
-			} else {
+			case r.opts.All:
 				r.typeFull(b, t)
+			default:
+				r.typeWithSummary(b, t)
 			}
 			return
 		}
@@ -516,6 +519,65 @@ func (r *renderer) typeSrc(b *strings.Builder, t *doc.Type) {
 	fmt.Fprintf(b, "## type %s\n\n", t.Name)
 	b.WriteString(codeBlock(r.source(t.Decl)))
 	b.WriteString("\n")
+}
+
+// typeWithSummary renders a type for the default symbol view: the
+// type declaration with its body expanded, the doc comment in full,
+// then one-line signatures for the type's constants, variables,
+// constructors, and methods. It matches the compact layout produced
+// by "go doc <pkg> <type>".
+func (r *renderer) typeWithSummary(b *strings.Builder, t *doc.Type) {
+	fmt.Fprintf(b, "## type %s\n\n", t.Name)
+	b.WriteString(codeBlock(r.typeDecl(t.Decl, true)))
+	b.WriteString("\n")
+	if t.Doc != "" {
+		b.WriteString(r.prose(t.Doc, 3))
+		b.WriteString("\n")
+	}
+	if !r.hasAnySubsymbol(t) {
+		return
+	}
+	b.WriteString("```go\n")
+	for _, c := range t.Consts {
+		if line := r.valueOneLine(c.Decl); line != "" {
+			b.WriteString(line + "\n")
+		}
+	}
+	for _, v := range t.Vars {
+		if line := r.valueOneLine(v.Decl); line != "" {
+			b.WriteString(line + "\n")
+		}
+	}
+	for _, f := range t.Funcs {
+		if r.symbolVisible(f.Name) {
+			b.WriteString(r.decl(f.Decl) + "\n")
+		}
+	}
+	for _, m := range t.Methods {
+		if r.symbolVisible(m.Name) {
+			b.WriteString(r.decl(m.Decl) + "\n")
+		}
+	}
+	b.WriteString("```\n")
+}
+
+// hasAnySubsymbol reports whether t has any visible constants,
+// variables, constructors, or methods to summarize.
+func (r *renderer) hasAnySubsymbol(t *doc.Type) bool {
+	if len(t.Consts) > 0 || len(t.Vars) > 0 {
+		return true
+	}
+	for _, f := range t.Funcs {
+		if r.symbolVisible(f.Name) {
+			return true
+		}
+	}
+	for _, m := range t.Methods {
+		if r.symbolVisible(m.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // field renders a single struct field as the field signature plus its
