@@ -186,11 +186,11 @@ func synopsisOf(dir string) string {
 // renderPackage resolves the package at pkgPath and returns its
 // markdown rendered through glamour at the given width.
 func renderPackage(pkgPath string, width int) (string, error) {
-	t, err := resolve.Resolve([]string{pkgPath})
+	t, err := resolve.Resolve([]string{pkgPath}, resolve.Options{})
 	if err != nil {
 		return "", err
 	}
-	md := render.Package(t.Pkg, t.Fset, t.Symbol, t.Method)
+	md := render.Package(t.Pkg, t.Fset, t.Symbol, t.Method, render.Options{All: true})
 	wrap := width
 	if wrap <= 0 || wrap > 100 {
 		wrap = 100

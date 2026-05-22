@@ -1,11 +1,12 @@
 // Package render converts parsed Go documentation into markdown.
 //
-// The markdown produced mirrors the structure of "go doc -all": a package
-// synopsis followed by sections for constants, variables, functions, and
-// types, with each type carrying its constructors and methods. Examples are
-// emitted inline beneath the symbol they exercise.
+// The output mirrors "go doc": a default compact view that shows
+// signatures with the package overview, an -all view that includes
+// every method, example, and note, a -short listing of one symbol per
+// line, and a -src view that emits the source code of the matched
+// declaration.
 //
-// The output is intended to be fed to a CommonMark renderer such as
+// The markdown is intended to be fed to a CommonMark renderer such as
 // Glamour; doc-comment prose is converted via go/doc/comment's Markdown
 // printer, and Go declarations are rendered as fenced code blocks.
 package render
@@ -22,28 +23,52 @@ import (
 	"strings"
 )
 
-// Package renders pkg as markdown.
+// Options controls the structure and verbosity of rendered output.
+type Options struct {
+	// All includes every symbol with its full documentation, methods,
+	// constructors, examples, and notes. Corresponds to "go doc -all".
+	All bool
+	// Short emits one line per symbol with no doc bodies and no
+	// package overview. Corresponds to "go doc -short".
+	Short bool
+	// Src renders the matched declaration as Go source with its body
+	// (and surrounding doc comments) preserved. Corresponds to
+	// "go doc -src".
+	Src bool
+	// CaseSensitive requires exact-case matching when looking up
+	// symbols. Otherwise symbol names match case-insensitively.
+	// Corresponds to "go doc -c".
+	CaseSensitive bool
+	// IncludeMain renders the contents of a package main; without it,
+	// only the package overview is shown for main packages.
+	// Corresponds to "go doc -cmd".
+	IncludeMain bool
+}
+
+// Package renders pkg as markdown subject to opts.
 //
-// When sym is empty, the full package is rendered. When sym is non-empty,
-// only the matching top-level symbol (function, type, constant, or
-// variable) is rendered; if method is also non-empty, the rendering is
-// further narrowed to that method or field of sym.
+// When sym is empty, the full package is rendered. When sym is
+// non-empty, only the matching top-level symbol is rendered; if method
+// is also non-empty, the rendering is further narrowed to that method
+// or field of sym.
 //
 // If the requested symbol or method does not exist, the returned string
-// describes the miss in place of the missing content; an error is not
-// reported because callers typically want to display something either way.
-func Package(pkg *doc.Package, fset *token.FileSet, sym, method string) string {
+// describes the miss in place of the missing content.
+func Package(pkg *doc.Package, fset *token.FileSet, sym, method string, opts Options) string {
 	r := &renderer{
 		pkg:    pkg,
 		fset:   fset,
+		opts:   opts,
 		parser: pkg.Parser(),
 	}
 	var b strings.Builder
-	r.header(&b)
+	if !opts.Short {
+		r.header(&b)
+	}
 	if sym == "" {
-		r.full(&b)
+		r.renderPackage(&b)
 	} else {
-		r.symbol(&b, sym, method)
+		r.renderSymbol(&b, sym, method)
 	}
 	return b.String()
 }
@@ -51,6 +76,7 @@ func Package(pkg *doc.Package, fset *token.FileSet, sym, method string) string {
 type renderer struct {
 	pkg    *doc.Package
 	fset   *token.FileSet
+	opts   Options
 	parser *comment.Parser
 }
 
@@ -60,67 +86,162 @@ func (r *renderer) header(b *strings.Builder) {
 	fmt.Fprintf(b, "```go\nimport %q\n```\n\n", r.pkg.ImportPath)
 }
 
-// full writes the whole package: overview, constants, variables, functions,
-// types, and notes.
-func (r *renderer) full(b *strings.Builder) {
+// renderPackage writes the package-level view selected by opts.
+func (r *renderer) renderPackage(b *strings.Builder) {
+	switch {
+	case r.opts.Short:
+		r.shortListing(b)
+	case r.opts.All:
+		r.allPackage(b)
+	default:
+		r.defaultPackage(b)
+	}
+}
+
+// defaultPackage matches the layout of "go doc <pkg>": package
+// overview, then constants/variables with full text, then function
+// signatures with their doc comments, then types with collapsed bodies
+// and the funcs that return them, but no methods or examples.
+func (r *renderer) defaultPackage(b *strings.Builder) {
+	if r.pkg.Doc != "" {
+		b.WriteString(r.prose(r.pkg.Doc, 2))
+		b.WriteString("\n")
+	}
+	if r.pkg.Name == "main" && !r.opts.IncludeMain {
+		return
+	}
+	if len(r.pkg.Consts) > 0 {
+		b.WriteString("## Constants\n\n")
+		r.values(b, r.pkg.Consts, true)
+	}
+	if len(r.pkg.Vars) > 0 {
+		b.WriteString("## Variables\n\n")
+		r.values(b, r.pkg.Vars, true)
+	}
+	for _, f := range r.pkg.Funcs {
+		r.functionDefault(b, f)
+	}
+	for _, t := range r.pkg.Types {
+		r.typeDefault(b, t)
+	}
+}
+
+// allPackage matches "go doc -all <pkg>": every symbol expanded with
+// methods, examples, and notes.
+func (r *renderer) allPackage(b *strings.Builder) {
 	if r.pkg.Doc != "" {
 		b.WriteString(r.prose(r.pkg.Doc, 2))
 		b.WriteString("\n")
 	}
 	r.examplesFor(b, r.pkg.Examples, 2)
+	if r.pkg.Name == "main" && !r.opts.IncludeMain {
+		return
+	}
 	if len(r.pkg.Consts) > 0 {
 		b.WriteString("## Constants\n\n")
-		r.values(b, r.pkg.Consts)
+		r.values(b, r.pkg.Consts, true)
 	}
 	if len(r.pkg.Vars) > 0 {
 		b.WriteString("## Variables\n\n")
-		r.values(b, r.pkg.Vars)
+		r.values(b, r.pkg.Vars, true)
 	}
 	for _, f := range r.pkg.Funcs {
-		r.function(b, f, 2)
+		r.functionFull(b, f, 2)
 	}
 	for _, t := range r.pkg.Types {
-		r.typ(b, t)
+		r.typeFull(b, t)
 	}
 	r.notes(b)
 }
 
-// symbol writes a single top-level symbol, optionally narrowed to a method
-// or field.
-func (r *renderer) symbol(b *strings.Builder, sym, method string) {
+// shortListing writes one line per top-level symbol, matching the
+// shape of "go doc -short": free functions at the top level, types
+// with a collapsed body, and a type's constructors and methods
+// indented beneath it.
+func (r *renderer) shortListing(b *strings.Builder) {
+	b.WriteString("```go\n")
 	for _, c := range r.pkg.Consts {
-		if hasName(c.Names, sym) {
-			r.values(b, []*doc.Value{c})
+		fmt.Fprintln(b, r.decl(c.Decl))
+	}
+	for _, v := range r.pkg.Vars {
+		fmt.Fprintln(b, r.decl(v.Decl))
+	}
+	for _, f := range r.pkg.Funcs {
+		fmt.Fprintln(b, r.decl(f.Decl))
+	}
+	for _, t := range r.pkg.Types {
+		fmt.Fprintln(b, r.typeDecl(t.Decl, false))
+		for _, f := range t.Funcs {
+			fmt.Fprintln(b, indent(r.decl(f.Decl), "    "))
+		}
+		for _, m := range t.Methods {
+			fmt.Fprintln(b, indent(r.decl(m.Decl), "    "))
+		}
+	}
+	b.WriteString("```\n")
+}
+
+// indent prefixes every non-empty line of s with prefix.
+func indent(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = prefix + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderSymbol writes a single top-level symbol, optionally narrowed
+// to a method or field. It always shows the symbol with its full
+// documentation; -all is implied when a specific symbol is requested.
+func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
+	eq := r.eq()
+	for _, c := range r.pkg.Consts {
+		if slices.ContainsFunc(c.Names, eq(sym)) {
+			r.values(b, []*doc.Value{c}, true)
 			return
 		}
 	}
 	for _, v := range r.pkg.Vars {
-		if hasName(v.Names, sym) {
-			r.values(b, []*doc.Value{v})
+		if slices.ContainsFunc(v.Names, eq(sym)) {
+			r.values(b, []*doc.Value{v}, true)
 			return
 		}
 	}
 	for _, f := range r.pkg.Funcs {
-		if f.Name == sym {
-			r.function(b, f, 2)
+		if eq(sym)(f.Name) {
+			if r.opts.Src {
+				r.functionSrc(b, f)
+			} else {
+				r.functionFull(b, f, 2)
+			}
 			return
 		}
 	}
 	for _, t := range r.pkg.Types {
-		if t.Name != sym {
+		if !eq(sym)(t.Name) {
 			continue
 		}
 		if method == "" {
-			r.typ(b, t)
+			if r.opts.Src {
+				r.typeSrc(b, t)
+			} else {
+				r.typeFull(b, t)
+			}
 			return
 		}
 		for _, m := range t.Methods {
-			if m.Name == method {
-				r.function(b, m, 2)
+			if eq(method)(m.Name) {
+				if r.opts.Src {
+					r.functionSrc(b, m)
+				} else {
+					r.functionFull(b, m, 2)
+				}
 				return
 			}
 		}
-		if f := findField(t.Decl, method); f != nil {
+		if f := findField(t.Decl, method, r.opts.CaseSensitive); f != nil {
 			r.field(b, t, method, f)
 			return
 		}
@@ -130,22 +251,49 @@ func (r *renderer) symbol(b *strings.Builder, sym, method string) {
 	fmt.Fprintf(b, "_no symbol named %s_\n", sym)
 }
 
-// values renders a group of constants or variables.
-func (r *renderer) values(b *strings.Builder, vs []*doc.Value) {
+// eq returns a per-target name-equality predicate honoring
+// CaseSensitive. The returned function is curried so it composes
+// neatly with slices.ContainsFunc.
+func (r *renderer) eq() func(target string) func(string) bool {
+	if r.opts.CaseSensitive {
+		return func(target string) func(string) bool {
+			return func(s string) bool { return s == target }
+		}
+	}
+	return func(target string) func(string) bool {
+		return func(s string) bool { return strings.EqualFold(s, target) }
+	}
+}
+
+// values renders a group of constants or variables. When withDoc is
+// false the doc comment is omitted (used by the short listing path,
+// which delegates to its own writer).
+func (r *renderer) values(b *strings.Builder, vs []*doc.Value, withDoc bool) {
 	for _, v := range vs {
 		b.WriteString(codeBlock(r.decl(v.Decl)))
 		b.WriteString("\n")
-		if v.Doc != "" {
+		if withDoc && v.Doc != "" {
 			b.WriteString(r.prose(v.Doc, 4))
 			b.WriteString("\n")
 		}
 	}
 }
 
-// function renders a free function or method.
-//
-// headingLevel is the markdown heading level used for the symbol name.
-func (r *renderer) function(b *strings.Builder, f *doc.Func, headingLevel int) {
+// functionDefault renders a free function in the default package view:
+// signature, then its doc comment.
+func (r *renderer) functionDefault(b *strings.Builder, f *doc.Func) {
+	fmt.Fprintf(b, "## func %s\n\n", funcHeading(f))
+	b.WriteString(codeBlock(r.decl(f.Decl)))
+	b.WriteString("\n")
+	if f.Doc != "" {
+		b.WriteString(r.prose(f.Doc, 3))
+		b.WriteString("\n")
+	}
+}
+
+// functionFull renders a function in the all/symbol view: signature,
+// doc comment, and any attached examples.
+func (r *renderer) functionFull(b *strings.Builder, f *doc.Func, headingLevel int) {
 	fmt.Fprintf(b, "%s func %s\n\n", strings.Repeat("#", headingLevel), funcHeading(f))
 	b.WriteString(codeBlock(r.decl(f.Decl)))
 	b.WriteString("\n")
@@ -156,10 +304,47 @@ func (r *renderer) function(b *strings.Builder, f *doc.Func, headingLevel int) {
 	r.examplesFor(b, f.Examples, headingLevel+1)
 }
 
-// typ renders a type and its attached constructors and methods.
-func (r *renderer) typ(b *strings.Builder, t *doc.Type) {
+// functionSrc renders the source of a function, including its body
+// and the doc comment carried on the AST, as a single Go code block.
+func (r *renderer) functionSrc(b *strings.Builder, f *doc.Func) {
+	fmt.Fprintf(b, "## func %s\n\n", funcHeading(f))
+	b.WriteString(codeBlock(r.source(f.Decl)))
+	b.WriteString("\n")
+}
+
+// typeDefault renders a type in the default package view: type
+// declaration with collapsed body (for structs/interfaces), the doc
+// comment, and the constructor functions that return it.
+func (r *renderer) typeDefault(b *strings.Builder, t *doc.Type) {
 	fmt.Fprintf(b, "## type %s\n\n", t.Name)
-	b.WriteString(codeBlock(r.decl(t.Decl)))
+	b.WriteString(codeBlock(r.typeDecl(t.Decl, false)))
+	b.WriteString("\n")
+	if t.Doc != "" {
+		b.WriteString(r.prose(t.Doc, 3))
+		b.WriteString("\n")
+	}
+	if len(t.Consts) > 0 {
+		r.values(b, t.Consts, true)
+	}
+	if len(t.Vars) > 0 {
+		r.values(b, t.Vars, true)
+	}
+	for _, f := range t.Funcs {
+		fmt.Fprintf(b, "### func %s\n\n", f.Name)
+		b.WriteString(codeBlock(r.decl(f.Decl)))
+		b.WriteString("\n")
+		if f.Doc != "" {
+			b.WriteString(r.prose(f.Doc, 4))
+			b.WriteString("\n")
+		}
+	}
+}
+
+// typeFull renders a type with everything: full declaration, doc
+// comment, examples, constructors, methods, and attached values.
+func (r *renderer) typeFull(b *strings.Builder, t *doc.Type) {
+	fmt.Fprintf(b, "## type %s\n\n", t.Name)
+	b.WriteString(codeBlock(r.typeDecl(t.Decl, true)))
 	b.WriteString("\n")
 	if t.Doc != "" {
 		b.WriteString(r.prose(t.Doc, 3))
@@ -167,17 +352,24 @@ func (r *renderer) typ(b *strings.Builder, t *doc.Type) {
 	}
 	r.examplesFor(b, t.Examples, 3)
 	if len(t.Consts) > 0 {
-		r.values(b, t.Consts)
+		r.values(b, t.Consts, true)
 	}
 	if len(t.Vars) > 0 {
-		r.values(b, t.Vars)
+		r.values(b, t.Vars, true)
 	}
 	for _, f := range t.Funcs {
-		r.function(b, f, 3)
+		r.functionFull(b, f, 3)
 	}
 	for _, m := range t.Methods {
-		r.function(b, m, 3)
+		r.functionFull(b, m, 3)
 	}
+}
+
+// typeSrc renders the source code of a type declaration.
+func (r *renderer) typeSrc(b *strings.Builder, t *doc.Type) {
+	fmt.Fprintf(b, "## type %s\n\n", t.Name)
+	b.WriteString(codeBlock(r.source(t.Decl)))
+	b.WriteString("\n")
 }
 
 // field renders a single struct field as the field signature plus its
@@ -229,13 +421,9 @@ func (r *renderer) examplesFor(b *strings.Builder, exs []*doc.Example, headingLe
 	}
 }
 
-// exampleCode renders an example's body as Go source. Examples are
-// stored as the body block of an ExampleXxx function; we unwrap the
-// outer braces and dedent so the code reads naturally.
+// exampleCode renders an example's body as Go source.
 func (r *renderer) exampleCode(ex *doc.Example) string {
 	if ex.Play != nil {
-		// Use the synthesized playable form when available: it includes
-		// any necessary imports and a clean package declaration.
 		return r.decl(ex.Play)
 	}
 	block, ok := ex.Code.(*ast.BlockStmt)
@@ -249,8 +437,7 @@ func (r *renderer) exampleCode(ex *doc.Example) string {
 	return dedent(strings.Join(parts, "\n"))
 }
 
-// dedent removes one level of leading tab indentation from each line,
-// which is what example bodies inherit from being inside a function.
+// dedent removes one level of leading tab indentation from each line.
 func dedent(s string) string {
 	lines := strings.Split(s, "\n")
 	for i, line := range lines {
@@ -259,8 +446,7 @@ func dedent(s string) string {
 	return strings.Join(lines, "\n")
 }
 
-// prose converts a godoc comment string into markdown, with headings
-// inside the comment starting at the given level.
+// prose converts a godoc comment string into markdown.
 func (r *renderer) prose(text string, headingLevel int) string {
 	p := &comment.Printer{
 		HeadingLevel: headingLevel,
@@ -269,10 +455,7 @@ func (r *renderer) prose(text string, headingLevel int) string {
 	return string(p.Markdown(r.parser.Parse(text)))
 }
 
-// pkgGoDevURL renders a parsed doc link as a pkg.go.dev URL. Links to
-// the current package use a bare fragment so they remain useful when
-// the document is read outside a hyperlinking renderer; cross-package
-// links use the full pkg.go.dev URL.
+// pkgGoDevURL renders a parsed doc link as a pkg.go.dev URL.
 func pkgGoDevURL(link *comment.DocLink) string {
 	frag := link.Name
 	if link.Recv != "" {
@@ -311,6 +494,69 @@ func (r *renderer) decl(node ast.Node) string {
 	return buf.String()
 }
 
+// typeDecl renders a type declaration. When expand is false the body
+// of a struct or interface literal is collapsed to "{ ... }", matching
+// the compact format produced by "go doc <pkg>".
+func (r *renderer) typeDecl(decl *ast.GenDecl, expand bool) string {
+	if expand {
+		return r.decl(decl)
+	}
+	var b strings.Builder
+	first := true
+	for _, spec := range decl.Specs {
+		ts, ok := spec.(*ast.TypeSpec)
+		if !ok {
+			continue
+		}
+		if !first {
+			b.WriteString("\n")
+		}
+		first = false
+		b.WriteString("type ")
+		b.WriteString(ts.Name.Name)
+		if ts.TypeParams != nil {
+			b.WriteString(r.exprText(ts.TypeParams))
+		}
+		if ts.Assign.IsValid() {
+			b.WriteString(" = ")
+		} else {
+			b.WriteString(" ")
+		}
+		b.WriteString(r.oneLineType(ts.Type))
+	}
+	return b.String()
+}
+
+// oneLineType renders a type expression as a single line, collapsing
+// struct and interface bodies to "{ ... }".
+func (r *renderer) oneLineType(t ast.Expr) string {
+	switch t.(type) {
+	case *ast.StructType:
+		return "struct{ ... }"
+	case *ast.InterfaceType:
+		return "interface{ ... }"
+	}
+	return r.exprText(t)
+}
+
+// exprText pretty-prints an AST expression node as Go source.
+func (r *renderer) exprText(node ast.Node) string {
+	var buf bytes.Buffer
+	cfg := &printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 4}
+	_ = cfg.Fprint(&buf, r.fset, node)
+	return buf.String()
+}
+
+// source pretty-prints a declaration with its full body and any
+// attached doc comments. It relies on the AST having been parsed
+// (and preserved) with doc comments intact.
+func (r *renderer) source(node ast.Node) string {
+	var buf bytes.Buffer
+	cfg := &printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 4}
+	_ = cfg.Fprint(&buf, r.fset, node)
+	return buf.String()
+}
+
 // codeBlock wraps s in a fenced ```go block.
 func codeBlock(s string) string {
 	return "```go\n" + strings.TrimRight(s, "\n") + "\n```\n"
@@ -325,13 +571,16 @@ func funcHeading(f *doc.Func) string {
 	return "(" + f.Recv + ") " + f.Name
 }
 
-// hasName reports whether name appears in names.
-func hasName(names []string, name string) bool {
-	return slices.Contains(names, name)
-}
-
 // findField looks up a field by name in a struct type declaration.
-func findField(decl *ast.GenDecl, name string) *ast.Field {
+//
+// caseSensitive controls whether matching is exact.
+func findField(decl *ast.GenDecl, name string, caseSensitive bool) *ast.Field {
+	match := func(s string) bool {
+		if caseSensitive {
+			return s == name
+		}
+		return strings.EqualFold(s, name)
+	}
 	for _, spec := range decl.Specs {
 		ts, ok := spec.(*ast.TypeSpec)
 		if !ok {
@@ -343,7 +592,7 @@ func findField(decl *ast.GenDecl, name string) *ast.Field {
 		}
 		for _, f := range st.Fields.List {
 			for _, fn := range f.Names {
-				if fn.Name == name {
+				if match(fn.Name) {
 					return f
 				}
 			}

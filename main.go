@@ -4,15 +4,21 @@
 // documentation for a package or symbol; with no arguments, it opens a
 // TUI listing the packages of the current module.
 //
+// The flag and positional-argument grammar matches "go doc" so glodoc
+// can be used as a drop-in replacement.
+//
 // Examples:
 //
 //	glodoc fmt
 //	glodoc fmt.Println
 //	glodoc bytes Buffer.WriteString
-//	glodoc ./internal/render
+//	glodoc -all errors
+//	glodoc -short fmt
+//	glodoc -src fmt.Println
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -25,11 +31,35 @@ import (
 	"ily.dev/glodoc/internal/tui"
 )
 
+var (
+	flagAll   = flag.Bool("all", false, "Show all the documentation for the package.")
+	flagC     = flag.Bool("c", false, "Respect case when matching symbols.")
+	flagCmd   = flag.Bool("cmd", false, "Treat a command (package main) like a regular package.")
+	flagShort = flag.Bool("short", false, "One-line representation for each symbol.")
+	flagSrc   = flag.Bool("src", false, "Show the full source code for the symbol.")
+	flagU     = flag.Bool("u", false, "Show documentation for unexported as well as exported symbols, methods, and fields.")
+)
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	flag.Usage = usage
+	flag.Parse()
+	if err := run(flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "glodoc:", err)
 		os.Exit(1)
 	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, `Usage of glodoc:
+    glodoc
+    glodoc <pkg>
+    glodoc <sym>[.<methodOrField>]
+    glodoc [<pkg>.]<sym>[.<methodOrField>]
+    glodoc [<pkg>.][<sym>.]<methodOrField>
+    glodoc <pkg> <sym>[.<methodOrField>]
+
+Flags:`)
+	flag.PrintDefaults()
 }
 
 func run(args []string) error {
@@ -42,11 +72,20 @@ func run(args []string) error {
 // renderOnce resolves the arguments, renders the result through
 // glamour, and writes it out (paginating if attached to a terminal).
 func renderOnce(args []string) error {
-	target, err := resolve.Resolve(args)
+	target, err := resolve.Resolve(args, resolve.Options{
+		Unexported: *flagU,
+		Source:     *flagSrc,
+	})
 	if err != nil {
 		return err
 	}
-	md := render.Package(target.Pkg, target.Fset, target.Symbol, target.Method)
+	md := render.Package(target.Pkg, target.Fset, target.Symbol, target.Method, render.Options{
+		All:           *flagAll,
+		Short:         *flagShort,
+		Src:           *flagSrc,
+		CaseSensitive: *flagC,
+		IncludeMain:   *flagCmd,
+	})
 	out, err := styled(md)
 	if err != nil {
 		return err
