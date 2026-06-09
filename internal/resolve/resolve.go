@@ -9,8 +9,11 @@
 // fuzzy lookup by trailing path segment as the fallback at each step;
 // two arguments are a package followed by "<sym>[.<methodOrField>]".
 //
-// Package lookup is performed via go/build, the same mechanism go doc
-// uses, so paths are resolved without the cost of dependency analysis.
+// A fully qualified or relative package path is resolved with go/build,
+// the same mechanism go doc uses. A bare or partial path is matched
+// against an index of the standard library, the current module, and—only
+// when those do not match—the current module's dependencies; see package
+// modindex.
 package resolve
 
 import (
@@ -21,7 +24,6 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -245,27 +247,24 @@ func (r *resolver) docMode() []any {
 	return []any{mode}
 }
 
-// fuzzy searches indexed package directories for one whose import
-// path is or ends with name, matching go doc's findNextPackage. It
-// returns the first hit; an upper-case name returns no match because
-// it cannot be a package name.
+// fuzzy searches indexed package directories for one whose import path
+// is or ends with name, matching go doc's findNextPackage: the standard
+// library and current module are tried first, then the current module's
+// dependencies. It returns the first candidate that imports cleanly; an
+// upper-case name returns no match because it cannot be a package name.
 func (r *resolver) fuzzy(name, sym, method string) (*Target, error) {
 	if name == "" || token.IsExported(name) {
 		return nil, fmt.Errorf("no package matching %q", name)
 	}
-	name = path.Clean(name)
-	suffix := "/" + name
-	for _, e := range modindex.Default().All() {
-		if e.ImportPath == name || strings.HasSuffix(e.ImportPath, suffix) {
-			bpkg, err := build.Default.ImportDir(e.Dir, build.ImportComment)
-			if err != nil {
-				continue
-			}
-			if bpkg.ImportPath == "" || bpkg.ImportPath == "." {
-				bpkg.ImportPath = e.ImportPath
-			}
-			return r.fromBuildPackage(bpkg, sym, method)
+	for _, e := range modindex.Default().FindPackage(name) {
+		bpkg, err := build.Default.ImportDir(e.Dir, build.ImportComment)
+		if err != nil {
+			continue
 		}
+		if bpkg.ImportPath == "" || bpkg.ImportPath == "." {
+			bpkg.ImportPath = e.ImportPath
+		}
+		return r.fromBuildPackage(bpkg, sym, method)
 	}
 	return nil, fmt.Errorf("no package matching %q", name)
 }
