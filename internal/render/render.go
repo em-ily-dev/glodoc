@@ -349,6 +349,24 @@ func (r *renderer) renderSymbol(b *strings.Builder, sym, method string) {
 			return
 		}
 	}
+	// Consts and vars whose type is a named type in this package are
+	// grouped by go/doc under that type rather than under Package.Consts
+	// or Package.Vars. Search those too, so a value like a typed flag or
+	// enumerator resolves even though it is not free-standing.
+	for _, t := range r.pkg.Types {
+		for _, c := range t.Consts {
+			if slices.ContainsFunc(c.Names, match) {
+				r.values(b, []*doc.Value{c}, true)
+				return
+			}
+		}
+		for _, v := range t.Vars {
+			if slices.ContainsFunc(v.Names, match) {
+				r.values(b, []*doc.Value{v}, true)
+				return
+			}
+		}
+	}
 	for _, f := range r.pkg.Funcs {
 		if match(f.Name) {
 			if r.opts.Src {
