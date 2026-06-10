@@ -120,6 +120,32 @@ func matchSuffix(entries []Entry, name string) []Entry {
 	return matches
 }
 
+// Root is a code root: a directory tree of packages whose import
+// paths are the root's import path extended with the path from Dir.
+type Root struct {
+	// Dir is the absolute filesystem path of the root.
+	Dir string
+	// ImportPath is the import path of the root itself; empty for
+	// GOROOT/src, whose packages' import paths begin at its
+	// subdirectories.
+	ImportPath string
+}
+
+// Roots returns the code roots used to derive canonical import paths
+// from directories: GOROOT/src and the current module, in the order go
+// doc consults its own code roots. Dependency modules are not included;
+// packages found there carry their canonical import path already.
+func Roots() []Root {
+	var roots []Root
+	if goroot := build.Default.GOROOT; goroot != "" {
+		roots = append(roots, Root{Dir: filepath.Join(goroot, "src")})
+	}
+	if dir, mod, ok := findModule(); ok {
+		roots = append(roots, Root{Dir: dir, ImportPath: mod})
+	}
+	return roots
+}
+
 // Module returns just the entries belonging to the current module.
 func (idx *Index) Module() []Entry {
 	var ms []Entry

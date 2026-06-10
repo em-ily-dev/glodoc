@@ -38,7 +38,6 @@ var tests = []test{
 		name: "sanity check",
 		args: []string{p},
 		yes:  []string{`type ExportedType struct`},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Package dump includes import, package statement.
@@ -48,8 +47,7 @@ var tests = []test{
 		// ADAPTED (parameterized): upstream `package pkg.*cmd/go/internal/doc/testdata`
 		// hard-codes its testdata import path. pQuoted = regexp.QuoteMeta of the
 		// import path printed in our corpus's package clause.
-		yes:  []string{`package pkg.*` + pQuoted},
-		diff: "render: header shows the argument path, not the canonical import path",
+		yes: []string{`package pkg.*` + pQuoted},
 	},
 
 	// Constants.
@@ -108,7 +106,6 @@ var tests = []test{
 			`type T1 T2`,                       // Type alias does not display as type declaration.
 			`ignore:directive`,                 // Directives should be dropped.
 		},
-		diff: "render: one-line declaration summaries not ported (oneLineNode)",
 	},
 	// Package dump -all
 	{
@@ -178,14 +175,12 @@ var tests = []test{
 			`func \(unexportedType\)`,
 			`ignore:directive`,
 		},
-		diff: "render: -all layout (section labels, declaration formatting, notes)",
 	},
 	// Package with just the package declaration. Issue 31457.
 	{
 		name: "only package declaration",
 		args: []string{"-all", p + "/nested/empty"},
 		yes:  []string{`package empty .*import`},
-		diff: "render: legacy markdown chrome",
 	},
 	// Package dump -short
 	{
@@ -198,7 +193,6 @@ var tests = []test{
 		no: []string{
 			`MultiLine(String|Method|Field)`, // No data from multi line portions.
 		},
-		diff: "render: -short prints full declarations, not one-line summaries",
 	},
 	// Package dump -u
 	{
@@ -217,7 +211,6 @@ var tests = []test{
 			`MultiLine(String|Method|Field)`,   // No data from multi line portions.
 			`ignore:directive`,
 		},
-		diff: "render: one-line declaration summaries not ported (oneLineNode)",
 	},
 	// Package dump -u -all
 	{
@@ -274,7 +267,6 @@ var tests = []test{
 		no: []string{
 			`ignore:directive`,
 		},
-		diff: "render: -all layout (section labels, declaration formatting, notes)",
 	},
 
 	// Single constant.
@@ -285,7 +277,6 @@ var tests = []test{
 			`Comment about exported constant`, // Include comment.
 			`const ExportedConstant = 1`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Single constant -u.
 	{
@@ -295,7 +286,6 @@ var tests = []test{
 			`Comment about internal constant`, // Include comment.
 			`const internalConstant = 2`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Block of constants.
 	{
@@ -313,7 +303,6 @@ var tests = []test{
 		no: []string{
 			`constThree`, // No unexported constant.
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Block of constants -u.
 	{
@@ -322,7 +311,6 @@ var tests = []test{
 		yes: []string{
 			`constThree = 3.*Comment on line with constThree`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Block of constants -src.
 	{
@@ -334,7 +322,6 @@ var tests = []test{
 			`ConstTwo.*=.*2.*Comment on line with ConstTwo`,
 			`constThree`, // Even unexported constants.
 		},
-		diff: "render: -src prints the go/doc-filtered AST, losing unexported entries",
 	},
 	// Block of constants with carryover type from unexported field.
 	{
@@ -345,7 +332,6 @@ var tests = []test{
 			`constLeft3, ConstRight3`,
 			`ConstLeft4, ConstRight4`,
 		},
-		diff: "render: value blocks print the go/doc-filtered AST, with unexported names mangled",
 	},
 	// Block of constants -u with carryover type from unexported field.
 	{
@@ -358,7 +344,6 @@ var tests = []test{
 			`constLeft3, ConstRight3`,
 			`ConstLeft4, ConstRight4`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Single variable.
@@ -369,7 +354,6 @@ var tests = []test{
 			`ExportedVariable`, // Include comment.
 			`var ExportedVariable = 1`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Single variable -u.
 	{
@@ -379,7 +363,6 @@ var tests = []test{
 			`Comment about internal variable`, // Include comment.
 			`var internalVariable = 2`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Block of variables.
 	{
@@ -395,7 +378,6 @@ var tests = []test{
 		no: []string{
 			`varThree= 3`, // No unexported variable. NOTE: missing space is upstream's (pattern can never match); preserved verbatim.
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Block of variables -u.
 	{
@@ -404,7 +386,6 @@ var tests = []test{
 		yes: []string{
 			`varThree = 3.*Comment on line with varThree`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Function.
@@ -415,7 +396,6 @@ var tests = []test{
 			`Comment about exported function`, // Include comment.
 			`func ExportedFunc\(a int\) bool`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Function -u.
 	{
@@ -425,7 +405,6 @@ var tests = []test{
 			`Comment about internal function`, // Include comment.
 			`func internalFunc\(a int\) bool`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Function with -src.
 	{
@@ -436,7 +415,6 @@ var tests = []test{
 			`func ExportedFunc\(a int\) bool`,
 			`return true != false`, // Include body.
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Type.
@@ -477,7 +455,6 @@ var tests = []test{
 			`unexportedTypedConstant`,       // No unexported constant.
 			`error`,                         // No embedded error.
 		},
-		diff: "render: unexported-elision note differs from go doc wording",
 	},
 	// Type with -src. Will see unexported fields.
 	{
@@ -500,7 +477,6 @@ var tests = []test{
 			`unexportedMethod`,              // No unexported method.
 			`unexportedTypedConstant`,       // No unexported constant.
 		},
-		diff: "render: -src type omits associated constants, constructors, and methods",
 	},
 	// Type -all.
 	{
@@ -526,7 +502,6 @@ var tests = []test{
 		no: []string{
 			`unexportedType`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Type T1 dump (alias).
 	{
@@ -565,7 +540,6 @@ var tests = []test{
 		no: []string{
 			`Has unexported fields`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Unexported type with -u.
 	{
@@ -579,7 +553,6 @@ var tests = []test{
 			`ExportedTypedConstant_unexported unexportedType = iota`,
 			`const unexportedTypedConstant unexportedType = 1`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Interface.
@@ -608,7 +581,6 @@ var tests = []test{
 			`unexportedMethod`,              // No unexported method.
 			`unexportedTypedConstant`,       // No unexported constant.
 		},
-		diff: "render: unexported-elision note differs from go doc wording",
 	},
 	// Interface -u with unexported methods.
 	{
@@ -626,7 +598,6 @@ var tests = []test{
 		no: []string{
 			`Has unexported methods`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Interface with comparable constraint.
 	{
@@ -642,7 +613,6 @@ var tests = []test{
 		no: []string{
 			`unexportedMethod`, // No unexported method.
 		},
-		diff: "render: unexported-elision note differs from go doc wording",
 	},
 	// Interface with only comparable (no unexported methods).
 	{
@@ -657,7 +627,6 @@ var tests = []test{
 		no: []string{
 			`Has unexported methods`, // Should NOT appear - no unexported methods.
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Interface method.
@@ -671,7 +640,6 @@ var tests = []test{
 		no: []string{
 			`Comment about exported interface`,
 		},
-		diff: "render: interface method view renders prose, not the source comment block",
 	},
 	// Interface method at package level.
 	{
@@ -691,7 +659,6 @@ var tests = []test{
 			// followed by the method-with-line-comment rendering) kept.
 			`Comment before exported method\..*ExportedMethod\(\) // Comment on line with exported method`,
 		},
-		diff: "render: package-level method lookup not implemented",
 	},
 
 	// Method.
@@ -702,7 +669,6 @@ var tests = []test{
 			`func \(ExportedType\) ExportedMethod\(a int\) bool`,
 			`Comment about exported method`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Method  with -u.
 	{
@@ -712,7 +678,6 @@ var tests = []test{
 			`func \(ExportedType\) unexportedMethod\(a int\) bool`,
 			`Comment about unexported method`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	// Method with -src.
 	{
@@ -723,7 +688,6 @@ var tests = []test{
 			`Comment about exported method`,
 			`return true != true`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Field.
@@ -737,7 +701,6 @@ var tests = []test{
 			`Comment on line with exported field`,
 			`other fields elided`,
 		},
-		diff: "render: field view prints nothing (go/printer cannot print a bare ast.Field)",
 	},
 
 	// Field with -u.
@@ -748,7 +711,6 @@ var tests = []test{
 			`unexportedField int`,
 			`Comment on line with unexported field`,
 		},
-		diff: "render: field view prints nothing (go/printer cannot print a bare ast.Field)",
 	},
 
 	// Field of struct with only one field.
@@ -757,7 +719,6 @@ var tests = []test{
 		args: []string{p, `ExportedStructOneField.OnlyField`},
 		yes:  []string{`the only field`},
 		no:   []string{`other fields elided`},
-		diff: "render: field view prints nothing (go/printer cannot print a bare ast.Field)",
 	},
 
 	// Case matching off.
@@ -768,7 +729,6 @@ var tests = []test{
 			`CaseMatch`,
 			`Casematch`,
 		},
-		diff: "render: only the first matching symbol is printed",
 	},
 
 	// Case matching on.
@@ -781,7 +741,6 @@ var tests = []test{
 		no: []string{
 			`CaseMatch`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// Merging comments with -src.
@@ -800,7 +759,6 @@ var tests = []test{
 			`B comment`,
 			`B doc`, // upstream lists `B doc` twice; duplicate preserved verbatim
 		},
-		diff: "render: -src loses comments inside declarations (no printer.CommentedNode)",
 	},
 	{
 		name: "merge comments with -src B",
@@ -817,7 +775,6 @@ var tests = []test{
 			`A comment`,
 			`A doc`, // upstream lists `A doc` twice; duplicate preserved verbatim
 		},
-		diff: "render: -src loses comments inside declarations (no printer.CommentedNode)",
 	},
 
 	// No dups with -u. Issue 21797.
@@ -836,7 +793,6 @@ var tests = []test{
 			// cannot occur.
 			`\) const`, // This will appear if the const decl appears twice.
 		},
-		diff: "render: legacy markdown chrome",
 	},
 
 	// ------------------------------------------------------------------
@@ -895,7 +851,6 @@ var tests = []test{
 			// in order — is preserved.
 			`Comment about exported function with formatting\. Example fmt\.Println\(FormattedDoc\(\)\) Text after pre-formatted block\.`,
 		},
-		diff: "render: legacy markdown chrome",
 	},
 	{
 		name: "formatted doc on type field",
@@ -920,8 +875,7 @@ var tests = []test{
 			`// Comment before exported field with formatting\. // // Example // // a\.ExportedField = 123 // // Text after pre-formatted block\.`,
 			`ExportedField int`,
 		},
-		no:   []string{"ignore:directive"},
-		diff: "render: field view prints nothing (go/printer cannot print a bare ast.Field)",
+		no: []string{"ignore:directive"},
 	},
 	{
 		name: "formatted doc on entire type",
@@ -934,8 +888,7 @@ var tests = []test{
 			`// Comment before exported field with formatting\. // // Example // // a\.ExportedField = 123 // // Text after pre-formatted block\.`,
 			`ExportedField int`,
 		},
-		no:   []string{"ignore:directive"},
-		diff: "render: comment directives leak into rendered output",
+		no: []string{"ignore:directive"},
 	},
 	{
 		name: "formatted doc on entire type with -all",
@@ -947,7 +900,6 @@ var tests = []test{
 			`// Comment before exported field with formatting\. // // Example // // a\.ExportedField = 123 // // Text after pre-formatted block\.`,
 			`ExportedField int`,
 		},
-		no:   []string{"ignore:directive"},
-		diff: "render: comment directives leak into rendered output",
+		no: []string{"ignore:directive"},
 	},
 }

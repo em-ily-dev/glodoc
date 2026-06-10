@@ -14,14 +14,16 @@
 // against an index of the standard library, the current module, and—only
 // when those do not match—the current module's dependencies; see package
 // modindex.
+//
+// Resolution stops at locating the package: the result identifies a
+// directory of Go source and the symbol selectors, and parsing is left
+// to the renderer, mirroring the seam between go doc's parseArgs and
+// parsePackage.
 package resolve
 
 import (
 	"fmt"
-	"go/ast"
 	"go/build"
-	"go/doc"
-	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -30,23 +32,13 @@ import (
 	"ily.dev/glodoc/internal/modindex"
 )
 
-// Options controls the loading and indexing of package documentation.
-type Options struct {
-	// Unexported requests inclusion of unexported declarations,
-	// methods, and fields. It corresponds to "go doc -u".
-	Unexported bool
-	// Source requests that parsed declarations retain their bodies
-	// and surrounding details so the renderer can emit source code.
-	// It corresponds to "go doc -src".
-	Source bool
-}
-
 // Target identifies a resolved documentation rendering target.
 type Target struct {
-	// Pkg is the assembled documentation for the package.
-	Pkg *doc.Package
-	// Fset is the file set used to parse the package's source.
-	Fset *token.FileSet
+	// Build locates the package's source on disk.
+	Build *build.Package
+	// UserPath is the string the user used to identify the package, or
+	// empty if the package is implied by the current directory.
+	UserPath string
 	// Symbol, if non-empty, narrows rendering to a single top-level symbol.
 	Symbol string
 	// Method, if non-empty, further narrows rendering to a method or
@@ -56,39 +48,32 @@ type Target struct {
 
 // Resolve interprets args (0, 1, or 2 elements) as a rendering target,
 // following go doc's parseArgs algorithm.
-func Resolve(args []string, opts Options) (*Target, error) {
-	r := resolver{opts: opts}
-	return r.parseArgs(args)
+func Resolve(args []string) (*Target, error) {
+	return parseArgs(args)
 }
 
-// LoadDir loads documentation for the package at the given filesystem
-// directory, bypassing import-path resolution. It is intended for
-// callers (such as the TUI) that already know the package's location
-// on disk and want to avoid the cost of consulting the module graph.
-func LoadDir(dir string, opts Options) (*Target, error) {
-	r := resolver{opts: opts}
+// LoadDir resolves the package at the given filesystem directory,
+// bypassing import-path resolution. It is intended for callers (such
+// as the TUI) that already know the package's location on disk and
+// want to avoid the cost of consulting the module graph.
+func LoadDir(dir string) (*Target, error) {
 	bpkg, err := build.Default.ImportDir(dir, build.ImportComment)
 	if err != nil {
 		return nil, err
 	}
-	return r.fromBuildPackage(bpkg, "", "")
-}
-
-// resolver carries the loading options through the resolution attempts.
-type resolver struct {
-	opts Options
+	return &Target{Build: bpkg}, nil
 }
 
 // parseArgs is a port of cmd/go/internal/doc.parseArgs. It returns the
 // first target found by walking the same sequence of fallbacks go doc
 // itself uses.
-func (r *resolver) parseArgs(args []string) (*Target, error) {
+func parseArgs(args []string) (*Target, error) {
 	wd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
 	if len(args) == 0 {
-		return r.fromDir(wd, "", "")
+		return fromDir(wd, "", "")
 	}
 
 	arg := args[0]
@@ -102,9 +87,10 @@ func (r *resolver) parseArgs(args []string) (*Target, error) {
 	case 2:
 		sym, method := splitSym(args[1])
 		if bpkg, err := build.Default.Import(args[0], wd, build.ImportComment); err == nil {
-			return r.fromBuildPackage(bpkg, sym, method)
+			return &Target{Build: bpkg, UserPath: args[0], Symbol: sym, Method: method}, nil
 		}
-		if t, err := r.fuzzy(arg, sym, method); err == nil {
+		if t, err := fuzzy(arg, sym, method); err == nil {
+			t.UserPath = args[0]
 			return t, nil
 		}
 		return nil, fmt.Errorf("no such package: %s", args[0])
@@ -122,13 +108,13 @@ func (r *resolver) parseArgs(args []string) (*Target, error) {
 	if filepath.IsAbs(arg) {
 		bpkg, err := build.Default.ImportDir(arg, build.ImportComment)
 		if err == nil {
-			return r.fromBuildPackage(bpkg, "", "")
+			return &Target{Build: bpkg, UserPath: arg}, nil
 		}
 		importErr = err
 	} else {
 		bpkg, err := build.Default.Import(arg, wd, build.ImportComment)
 		if err == nil {
-			return r.fromBuildPackage(bpkg, "", "")
+			return &Target{Build: bpkg, UserPath: arg}, nil
 		}
 		importErr = err
 	}
@@ -139,7 +125,7 @@ func (r *resolver) parseArgs(args []string) (*Target, error) {
 	// name as a package name.
 	if !strings.ContainsAny(arg, `/\`) && token.IsExported(arg) {
 		sym, method := splitSym(arg)
-		if t, err := r.fromDir(".", sym, method); err == nil {
+		if t, err := fromDir(".", sym, method); err == nil {
 			return t, nil
 		}
 	}
@@ -159,9 +145,10 @@ func (r *resolver) parseArgs(args []string) (*Target, error) {
 		pkgPath := arg[:period]
 		sym, method := splitSym(rest)
 		if bpkg, err := build.Default.Import(pkgPath, wd, build.ImportComment); err == nil {
-			return r.fromBuildPackage(bpkg, sym, method)
+			return &Target{Build: bpkg, UserPath: pkgPath, Symbol: sym, Method: method}, nil
 		}
-		if t, err := r.fuzzy(pkgPath, sym, method); err == nil {
+		if t, err := fuzzy(pkgPath, sym, method); err == nil {
+			t.UserPath = pkgPath
 			return t, nil
 		}
 	}
@@ -174,14 +161,14 @@ func (r *resolver) parseArgs(args []string) (*Target, error) {
 
 	// Last resort: assume a symbol in the current directory.
 	sym, method := splitSym(arg)
-	return r.fromDir(".", sym, method)
+	return fromDir(".", sym, method)
 }
 
-// fromDir parses the package rooted at dir and returns a Target.
+// fromDir locates the package rooted at dir and returns a Target.
 // The directory is resolved to an absolute path before lookup so
 // go/build can recognize it as GOROOT/src or a module member and set
 // the package's ImportPath accordingly.
-func (r *resolver) fromDir(dir, sym, method string) (*Target, error) {
+func fromDir(dir, sym, method string) (*Target, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -190,61 +177,7 @@ func (r *resolver) fromDir(dir, sym, method string) (*Target, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.fromBuildPackage(bpkg, sym, method)
-}
-
-// fromBuildPackage parses the Go source of bpkg and assembles a Target.
-func (r *resolver) fromBuildPackage(bpkg *build.Package, sym, method string) (*Target, error) {
-	fset := token.NewFileSet()
-	var files []*ast.File
-	parseList := func(dir string, names []string) error {
-		for _, name := range names {
-			f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.ParseComments)
-			if err != nil {
-				return err
-			}
-			files = append(files, f)
-		}
-		return nil
-	}
-	if err := parseList(bpkg.Dir, bpkg.GoFiles); err != nil {
-		return nil, err
-	}
-	if err := parseList(bpkg.Dir, bpkg.TestGoFiles); err != nil {
-		return nil, err
-	}
-	if err := parseList(bpkg.Dir, bpkg.XTestGoFiles); err != nil {
-		return nil, err
-	}
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no Go files in %s", bpkg.Dir)
-	}
-	importPath := bpkg.ImportPath
-	if importPath == "" || importPath == "." {
-		importPath = filepath.Base(bpkg.Dir)
-	}
-	docPkg, err := doc.NewFromFiles(fset, files, importPath, r.docMode()...)
-	if err != nil {
-		return nil, err
-	}
-	return &Target{Pkg: docPkg, Fset: fset, Symbol: sym, Method: method}, nil
-}
-
-// docMode returns the combined doc.Mode bitmask implied by the
-// resolver options, packaged as the single variadic argument expected
-// by doc.NewFromFiles.
-func (r *resolver) docMode() []any {
-	var mode doc.Mode
-	if r.opts.Unexported {
-		mode |= doc.AllDecls | doc.AllMethods
-	}
-	if r.opts.Source {
-		mode |= doc.PreserveAST
-	}
-	if mode == 0 {
-		return nil
-	}
-	return []any{mode}
+	return &Target{Build: bpkg, Symbol: sym, Method: method}, nil
 }
 
 // fuzzy searches indexed package directories for one whose import path
@@ -252,7 +185,7 @@ func (r *resolver) docMode() []any {
 // library and current module are tried first, then the current module's
 // dependencies. It returns the first candidate that imports cleanly; an
 // upper-case name returns no match because it cannot be a package name.
-func (r *resolver) fuzzy(name, sym, method string) (*Target, error) {
+func fuzzy(name, sym, method string) (*Target, error) {
 	if name == "" || token.IsExported(name) {
 		return nil, fmt.Errorf("no package matching %q", name)
 	}
@@ -264,7 +197,7 @@ func (r *resolver) fuzzy(name, sym, method string) (*Target, error) {
 		if bpkg.ImportPath == "" || bpkg.ImportPath == "." {
 			bpkg.ImportPath = e.ImportPath
 		}
-		return r.fromBuildPackage(bpkg, sym, method)
+		return &Target{Build: bpkg, Symbol: sym, Method: method}, nil
 	}
 	return nil, fmt.Errorf("no package matching %q", name)
 }

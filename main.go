@@ -1,11 +1,13 @@
-// Command glodoc renders Go package documentation as styled markdown.
+// Command glodoc renders Go package documentation in color.
 //
 // It mirrors the shape of glow: with arguments, it prints the
 // documentation for a package or symbol; with no arguments, it opens a
 // TUI listing the packages of the current module.
 //
-// The flag and positional-argument grammar matches "go doc" so glodoc
-// can be used as a drop-in replacement.
+// The flag and positional-argument grammar matches "go doc", and the
+// rendered text is go doc's exactly — styling is the only addition, and
+// output to a pipe carries no styling at all — so glodoc can be used as
+// a drop-in replacement.
 //
 // Examples:
 //
@@ -22,12 +24,13 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/charmbracelet/glamour"
+	"github.com/muesli/termenv"
 	"golang.org/x/term"
 
 	"ily.dev/glodoc/internal/pager"
 	"ily.dev/glodoc/internal/render"
 	"ily.dev/glodoc/internal/resolve"
+	"ily.dev/glodoc/internal/style"
 	"ily.dev/glodoc/internal/tui"
 )
 
@@ -80,60 +83,62 @@ func usage() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return runTUI()
+		return tui.Run()
 	}
 	return renderOnce(args)
 }
 
-// renderOnce resolves the arguments, renders the result through
-// glamour, and writes it out (paginating if attached to a terminal).
+// renderOnce resolves the arguments, renders the documentation they
+// select, and writes it out (paginating if attached to a terminal).
+// The dispatch mirrors cmd/go/internal/doc.do.
 func renderOnce(args []string) error {
-	target, err := resolve.Resolve(args, resolve.Options{
-		Unexported: *flagU,
-		Source:     *flagSrc,
-	})
+	target, err := resolve.Resolve(args)
 	if err != nil {
 		return err
 	}
-	md := render.Package(target.Pkg, target.Fset, target.Symbol, target.Method, render.Options{
+	opts := render.Options{
 		All:           *flagAll,
 		Short:         *flagShort,
 		Src:           *flagSrc,
 		Unexported:    *flagU,
 		CaseSensitive: *flagCase,
-		IncludeMain:   *flagCmd,
-	})
-	out, err := styled(md)
+		ShowCmd:       *flagCmd,
+	}
+	// The builtin package needs special treatment: its symbols are
+	// lower case but we want to see them, always.
+	if target.Build.ImportPath == "builtin" {
+		opts.Unexported = true
+	}
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		opts.Style = style.New(detectTheme())
+	}
+	pkg, err := render.New(target.Build, target.UserPath, opts)
 	if err != nil {
 		return err
+	}
+	out, found, err := pkg.Render(target.Symbol, target.Method)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return failMessage(pkg.PrettyPath(), target.Symbol, target.Method)
 	}
 	return pager.Write(out)
 }
 
-// styled renders markdown through glamour using an auto-detected style
-// that respects the terminal background.
-func styled(md string) (string, error) {
-	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(termWidth()),
-	)
-	if err != nil {
-		return "", err
+// failMessage mirrors go doc's failMessage for a single package path.
+func failMessage(path, symbol, method string) error {
+	if method == "" {
+		return fmt.Errorf("no symbol %s in package %s", symbol, path)
 	}
-	defer r.Close()
-	return r.Render(md)
+	return fmt.Errorf("no method or field %s.%s in package %s", symbol, method, path)
 }
 
-// runTUI starts the interactive package browser for the current module.
-func runTUI() error {
-	return tui.Run()
-}
-
-// termWidth reports a reasonable word-wrap width, clamped to a maximum
-// of 100 columns so prose remains comfortable to read on wide terminals.
-func termWidth() int {
-	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
-		return min(w, 100)
+// detectTheme probes the terminal background and returns the style
+// theme to use, "dark" or "light".
+func detectTheme() string {
+	if termenv.NewOutput(os.Stdout).HasDarkBackground() {
+		return "dark"
 	}
-	return 80
+	return "light"
 }
