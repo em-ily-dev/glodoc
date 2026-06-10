@@ -8,6 +8,8 @@
 // differences: ANSI escape sequences are stripped and every whitespace
 // run collapses to a single space, so color, wrapping, and indentation
 // never affect the comparison, while any difference in content does.
+// Standard error is compared the same way, after additionally dropping
+// each tool's program-name prefix; exit status must agree as well.
 //
 // Each case may also carry regular expressions, adapted from go doc's
 // own test suite, that the normalized glodoc output must (or must not)
@@ -55,6 +57,7 @@ var glodocBin string
 type test struct {
 	name string
 	args []string // Arguments to both "glodoc" and "go doc".
+	dir  string   // Working directory; empty means the package directory.
 	yes  []string // Regexps that must match the normalized output.
 	no   []string // Regexps that must not match.
 	diff string   // If non-empty, why the outputs are known to differ.
@@ -84,27 +87,41 @@ func testMain(m *testing.M) int {
 	return m.Run()
 }
 
+// TestGoDocParity runs the table adapted from go doc's own test suite.
 func TestGoDocParity(t *testing.T) {
-	for _, tc := range tests {
+	runTable(t, tests)
+}
+
+// TestLookupParity runs the cases adapted from go doc's non-table
+// tests, which exercise package lookup across the directory scan.
+func TestLookupParity(t *testing.T) {
+	runTable(t, lookupTests)
+}
+
+func runTable(t *testing.T, table []test) {
+	for _, tc := range table {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			goDoc, goDocOK := runTool(t, "go", append([]string{"doc"}, tc.args...)...)
-			glodoc, glodocOK := runTool(t, glodocBin, tc.args...)
+			goDoc := runTool(t, tc.dir, "go", append([]string{"doc"}, tc.args...)...)
+			glodoc := runTool(t, tc.dir, glodocBin, tc.args...)
 
 			var faults []string
-			if goDocOK != glodocOK {
-				faults = append(faults, fmt.Sprintf("exit status differs: go doc ok=%v, glodoc ok=%v", goDocOK, glodocOK))
+			if goDoc.ok != glodoc.ok {
+				faults = append(faults, fmt.Sprintf("exit status differs: go doc ok=%v, glodoc ok=%v", goDoc.ok, glodoc.ok))
 			}
-			if goDoc != glodoc {
-				faults = append(faults, "output differs from go doc\n"+firstDiff(goDoc, glodoc))
+			if goDoc.stdout != glodoc.stdout {
+				faults = append(faults, "output differs from go doc\n"+firstDiff(goDoc.stdout, glodoc.stdout))
+			}
+			if goDoc.stderr != glodoc.stderr {
+				faults = append(faults, fmt.Sprintf("stderr differs from go doc\ngo doc: %s\nglodoc: %s", goDoc.stderr, glodoc.stderr))
 			}
 			for _, pat := range tc.yes {
-				if !regexp.MustCompile(pat).MatchString(glodoc) {
+				if !regexp.MustCompile(pat).MatchString(glodoc.stdout) {
 					faults = append(faults, fmt.Sprintf("no match for %q", pat))
 				}
 			}
 			for _, pat := range tc.no {
-				if regexp.MustCompile(pat).MatchString(glodoc) {
+				if regexp.MustCompile(pat).MatchString(glodoc.stdout) {
 					faults = append(faults, fmt.Sprintf("unwanted match for %q", pat))
 				}
 			}
@@ -115,7 +132,7 @@ func TestGoDocParity(t *testing.T) {
 					t.Error(f)
 				}
 				if t.Failed() {
-					t.Logf("normalized glodoc output:\n%s", glodoc)
+					t.Logf("normalized glodoc output:\n%s", glodoc.stdout)
 				}
 			case len(faults) == 0:
 				t.Errorf("case passes in full; known divergence appears resolved (%s) — remove the diff annotation", tc.diff)
@@ -126,27 +143,38 @@ func TestGoDocParity(t *testing.T) {
 	}
 }
 
-// runTool executes a command and returns its normalized stdout and
-// whether it exited successfully. Stderr is reported through the test
-// log on failure paths but does not participate in comparison yet;
-// error-message parity is tracked as future work.
-func runTool(t *testing.T, bin string, args ...string) (string, bool) {
+// result holds one tool invocation's observable behavior, normalized
+// for comparison.
+type result struct {
+	stdout string
+	stderr string
+	ok     bool
+}
+
+// runTool executes a command in dir and returns its normalized output
+// and whether it exited successfully.
+func runTool(t *testing.T, dir, bin string, args ...string) result {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
+	cmd.Dir = dir
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	if err != nil && stderr.Len() > 0 {
-		t.Logf("%s %s: %v: %s", bin, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	return result{
+		stdout: normalize(stdout.String()),
+		stderr: normalizeStderr(stderr.String()),
+		ok:     err == nil,
 	}
-	return normalize(stdout.String()), err == nil
 }
 
 var (
 	oscEscape  = regexp.MustCompile(`\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)`)
 	csiEscape  = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 	whitespace = regexp.MustCompile(`\s+`)
+	// progPrefix is the program-name prefix each tool puts on its error
+	// lines: "doc: " for go doc (its log prefix), "glodoc: " for glodoc.
+	progPrefix = regexp.MustCompile(`(?m)^(doc|glodoc): `)
 )
 
 // normalize reduces tool output to its content: ANSI escape sequences
@@ -159,6 +187,13 @@ func normalize(s string) string {
 	s = csiEscape.ReplaceAllString(s, "")
 	s = whitespace.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
+}
+
+// normalizeStderr normalizes like normalize and additionally drops the
+// program-name prefix from each line, the one legitimate difference
+// between the tools' error output.
+func normalizeStderr(s string) string {
+	return normalize(progPrefix.ReplaceAllString(s, ""))
 }
 
 // firstDiff renders a short excerpt of two strings centered on the

@@ -514,7 +514,6 @@ var tests = []test{
 			`type T1 T2`,
 			`type ExportedType`,
 		},
-		diff: "resolve: ./dir.Symbol lacks the absolute-path candidate go doc tries",
 	},
 	// Type -u with unexported fields.
 	{

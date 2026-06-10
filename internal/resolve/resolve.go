@@ -5,17 +5,20 @@
 // The argument grammar mirrors go doc: zero arguments resolves to the
 // current directory; one argument is tried as a complete package path,
 // then (if the first letter is upper case) as a symbol in the current
-// directory, then progressively shorter "<pkg>.<sym>" splits, with a
-// fuzzy lookup by trailing path segment as the fallback at each step;
-// two arguments are a package followed by "<sym>[.<methodOrField>]".
+// directory, then progressively shorter "<pkg>.<sym>" splits, scanning
+// known package directories for a trailing-path-segment match at each
+// step; two arguments are a package followed by "<sym>[.<methodOrField>]".
 //
-// A fully qualified or relative package path is resolved with go/build,
-// the same mechanism go doc uses. A bare or partial path is matched
-// against an index of the standard library, the current module, and—only
-// when those do not match—the current module's dependencies; see package
-// modindex.
+// A Resolver is stateful, mirroring go doc's directory scanner: when a
+// resolved package turns out not to contain the requested symbol, the
+// caller resolves again and receives the next candidate, continuing the
+// scan where it left off. The more result reports whether such a retry
+// can yield anything. The scan order is the standard library, then the
+// current module, then the module's dependencies — the dependency tier
+// is consulted lazily, so lookups satisfied earlier never pay for the
+// module graph.
 //
-// Resolution stops at locating the package: the result identifies a
+// Resolution stops at locating a package: the result identifies a
 // directory of Go source and the symbol selectors, and parsing is left
 // to the renderer, mirroring the seam between go doc's parseArgs and
 // parsePackage.
@@ -26,6 +29,7 @@ import (
 	"go/build"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -46,34 +50,26 @@ type Target struct {
 	Method string
 }
 
+// Resolver resolves arguments to successive candidate packages. The
+// zero value is ready to use.
+type Resolver struct {
+	scan dirScan
+}
+
 // Resolve interprets args (0, 1, or 2 elements) as a rendering target,
-// following go doc's parseArgs algorithm.
-func Resolve(args []string) (*Target, error) {
-	return parseArgs(args)
-}
-
-// LoadDir resolves the package at the given filesystem directory,
-// bypassing import-path resolution. It is intended for callers (such
-// as the TUI) that already know the package's location on disk and
-// want to avoid the cost of consulting the module graph.
-func LoadDir(dir string) (*Target, error) {
-	bpkg, err := build.Default.ImportDir(dir, build.ImportComment)
-	if err != nil {
-		return nil, err
-	}
-	return &Target{Build: bpkg}, nil
-}
-
-// parseArgs is a port of cmd/go/internal/doc.parseArgs. It returns the
-// first target found by walking the same sequence of fallbacks go doc
-// itself uses.
-func parseArgs(args []string) (*Target, error) {
+// a port of go doc's parseArgs. Successive calls continue the
+// directory scan, returning the next candidate package for the same
+// arguments. The more result reports whether resolving again may find
+// another candidate; it is meaningful only to callers that did not
+// find what they wanted in the returned target.
+func (r *Resolver) Resolve(args []string) (t *Target, more bool, err error) {
 	wd, err := os.Getwd()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(args) == 0 {
-		return fromDir(wd, "", "")
+		t, err := fromDir(wd, "", "")
+		return t, false, err
 	}
 
 	arg := args[0]
@@ -85,19 +81,27 @@ func parseArgs(args []string) (*Target, error) {
 
 	switch len(args) {
 	case 2:
-		sym, method := splitSym(args[1])
+		sym, method, err := splitSym(args[1])
+		if err != nil {
+			return nil, false, err
+		}
 		if bpkg, err := build.Default.Import(args[0], wd, build.ImportComment); err == nil {
-			return &Target{Build: bpkg, UserPath: args[0], Symbol: sym, Method: method}, nil
+			return &Target{Build: bpkg, UserPath: args[0], Symbol: sym, Method: method}, false, nil
 		}
-		if t, err := fuzzy(arg, sym, method); err == nil {
-			t.UserPath = args[0]
-			return t, nil
+		for {
+			e, ok := r.findNextPackage(arg)
+			if !ok {
+				break
+			}
+			if bpkg, err := build.Default.ImportDir(e.Dir, build.ImportComment); err == nil {
+				return &Target{Build: bpkg, UserPath: arg, Symbol: sym, Method: method}, true, nil
+			}
 		}
-		return nil, fmt.Errorf("no such package: %s", args[0])
+		return nil, false, fmt.Errorf("no such package: %s", args[0])
 	case 1:
 		// fall through to the one-arg logic below
 	default:
-		return nil, fmt.Errorf("expected at most 2 arguments, got %d", len(args))
+		return nil, false, fmt.Errorf("expected at most 2 arguments, got %d", len(args))
 	}
 
 	// One-arg case. Try the arg as a complete package path first;
@@ -108,13 +112,13 @@ func parseArgs(args []string) (*Target, error) {
 	if filepath.IsAbs(arg) {
 		bpkg, err := build.Default.ImportDir(arg, build.ImportComment)
 		if err == nil {
-			return &Target{Build: bpkg, UserPath: arg}, nil
+			return &Target{Build: bpkg, UserPath: arg}, false, nil
 		}
 		importErr = err
 	} else {
 		bpkg, err := build.Default.Import(arg, wd, build.ImportComment)
 		if err == nil {
-			return &Target{Build: bpkg, UserPath: arg}, nil
+			return &Target{Build: bpkg, UserPath: arg}, false, nil
 		}
 		importErr = err
 	}
@@ -124,9 +128,11 @@ func parseArgs(args []string) (*Target, error) {
 	// problem of case-insensitive filesystems matching an upper-case
 	// name as a package name.
 	if !strings.ContainsAny(arg, `/\`) && token.IsExported(arg) {
-		sym, method := splitSym(arg)
-		if t, err := fromDir(".", sym, method); err == nil {
-			return t, nil
+		sym, method, err := splitSym(arg)
+		if err == nil {
+			if t, err := fromDir(".", sym, method); err == nil {
+				return t, false, nil
+			}
 		}
 	}
 
@@ -143,25 +149,110 @@ func parseArgs(args []string) (*Target, error) {
 			rest = arg[period+1:]
 		}
 		pkgPath := arg[:period]
-		sym, method := splitSym(rest)
+		sym, method, err := splitSym(rest)
+		if err != nil {
+			return nil, false, err
+		}
 		if bpkg, err := build.Default.Import(pkgPath, wd, build.ImportComment); err == nil {
-			return &Target{Build: bpkg, UserPath: pkgPath, Symbol: sym, Method: method}, nil
+			return &Target{Build: bpkg, UserPath: pkgPath, Symbol: sym, Method: method}, false, nil
 		}
-		if t, err := fuzzy(pkgPath, sym, method); err == nil {
-			t.UserPath = pkgPath
-			return t, nil
+		// See if we have the basename or tail of a package, as in json
+		// for encoding/json or ivy/value for robpike.io/ivy/value.
+		for {
+			e, ok := r.findNextPackage(pkgPath)
+			if !ok {
+				break
+			}
+			if bpkg, err := build.Default.ImportDir(e.Dir, build.ImportComment); err == nil {
+				return &Target{Build: bpkg, UserPath: pkgPath, Symbol: sym, Method: method}, true, nil
+			}
 		}
+		// The next iteration of the loop must scan all the directories again.
+		r.scan.Reset()
 	}
 
 	// If the original arg had a slash, no match is fatal: it can only
 	// have been a package path.
 	if slash >= 0 {
-		return nil, importErr
+		return nil, false, importErr
 	}
 
 	// Last resort: assume a symbol in the current directory.
-	sym, method := splitSym(arg)
-	return fromDir(".", sym, method)
+	sym, method, err := splitSym(arg)
+	if err != nil {
+		return nil, false, err
+	}
+	t, err = fromDir(".", sym, method)
+	return t, false, err
+}
+
+// findNextPackage returns the next indexed package whose import path
+// matches the (perhaps partial) package path pkg, continuing from
+// wherever the previous call left off. It is a port of go doc's
+// findNextPackage; an absolute path names its own directory and is
+// yielded exactly once.
+func (r *Resolver) findNextPackage(pkg string) (modindex.Entry, bool) {
+	if filepath.IsAbs(pkg) {
+		if r.scan.offset == 0 {
+			r.scan.offset = -1
+			return modindex.Entry{Dir: pkg}, true
+		}
+		return modindex.Entry{}, false
+	}
+	if pkg == "" || token.IsExported(pkg) { // Upper case symbol cannot be a package name.
+		return modindex.Entry{}, false
+	}
+	pkg = path.Clean(pkg)
+	pkgSuffix := "/" + pkg
+	for {
+		e, ok := r.scan.Next()
+		if !ok {
+			return modindex.Entry{}, false
+		}
+		if e.ImportPath == pkg || strings.HasSuffix(e.ImportPath, pkgSuffix) {
+			return e, true
+		}
+	}
+}
+
+// dirScan is a resumable cursor over the indexed package directories:
+// the eagerly indexed standard library and current module first, then
+// the lazily indexed dependencies, which are not touched until the
+// eager entries are exhausted.
+type dirScan struct {
+	offset int
+}
+
+// Next returns the next directory in the scan. The boolean is false
+// when the scan is done.
+func (d *dirScan) Next() (modindex.Entry, bool) {
+	all := modindex.Default().All()
+	if d.offset < len(all) {
+		e := all[d.offset]
+		d.offset++
+		return e, true
+	}
+	deps := modindex.Default().Deps()
+	if i := d.offset - len(all); i < len(deps) {
+		d.offset++
+		return deps[i], true
+	}
+	return modindex.Entry{}, false
+}
+
+// Reset puts the scan back at the beginning.
+func (d *dirScan) Reset() { d.offset = 0 }
+
+// LoadDir resolves the package at the given filesystem directory,
+// bypassing import-path resolution. It is intended for callers (such
+// as the TUI) that already know the package's location on disk and
+// want to avoid the cost of consulting the module graph.
+func LoadDir(dir string) (*Target, error) {
+	bpkg, err := build.Default.ImportDir(dir, build.ImportComment)
+	if err != nil {
+		return nil, err
+	}
+	return &Target{Build: bpkg}, nil
 }
 
 // fromDir locates the package rooted at dir and returns a Target.
@@ -180,32 +271,21 @@ func fromDir(dir, sym, method string) (*Target, error) {
 	return &Target{Build: bpkg, Symbol: sym, Method: method}, nil
 }
 
-// fuzzy searches indexed package directories for one whose import path
-// is or ends with name, matching go doc's findNextPackage: the standard
-// library and current module are tried first, then the current module's
-// dependencies. It returns the first candidate that imports cleanly; an
-// upper-case name returns no match because it cannot be a package name.
-func fuzzy(name, sym, method string) (*Target, error) {
-	if name == "" || token.IsExported(name) {
-		return nil, fmt.Errorf("no package matching %q", name)
+// splitSym splits "sym" or "sym.method" into its parts, mirroring go
+// doc's parseSymbol, including its rejection of deeper selectors.
+func splitSym(s string) (sym, method string, err error) {
+	if s == "" {
+		return "", "", nil
 	}
-	for _, e := range modindex.Default().FindPackage(name) {
-		bpkg, err := build.Default.ImportDir(e.Dir, build.ImportComment)
-		if err != nil {
-			continue
-		}
-		if bpkg.ImportPath == "" || bpkg.ImportPath == "." {
-			bpkg.ImportPath = e.ImportPath
-		}
-		return &Target{Build: bpkg, Symbol: sym, Method: method}, nil
+	elem := strings.Split(s, ".")
+	switch len(elem) {
+	case 1:
+	case 2:
+		method = elem[1]
+	default:
+		return "", "", fmt.Errorf("too many periods in symbol specification")
 	}
-	return nil, fmt.Errorf("no package matching %q", name)
-}
-
-// splitSym splits "sym" or "sym.method" into its parts.
-func splitSym(s string) (sym, method string) {
-	sym, method, _ = strings.Cut(s, ".")
-	return sym, method
+	return elem[0], method, nil
 }
 
 // isDotSlash reports whether s begins with a reference to the local

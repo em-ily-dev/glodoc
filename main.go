@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/muesli/termenv"
 	"golang.org/x/term"
@@ -90,13 +91,13 @@ func run(args []string) error {
 
 // renderOnce resolves the arguments, renders the documentation they
 // select, and writes it out (paginating if attached to a terminal).
-// The dispatch mirrors cmd/go/internal/doc.do.
+// It is a port of cmd/go/internal/doc.do's main loop: when a resolved
+// package does not contain the requested symbol, resolution continues
+// to the next candidate package — this is how "glodoc rand.Intn" scans
+// past crypto/rand to math/rand — until something is printed or the
+// candidates are exhausted.
 func renderOnce(args []string) error {
-	target, err := resolve.Resolve(args)
-	if err != nil {
-		return err
-	}
-	opts := render.Options{
+	baseOpts := render.Options{
 		All:           *flagAll,
 		Short:         *flagShort,
 		Src:           *flagSrc,
@@ -104,34 +105,64 @@ func renderOnce(args []string) error {
 		CaseSensitive: *flagCase,
 		ShowCmd:       *flagCmd,
 	}
-	// The builtin package needs special treatment: its symbols are
-	// lower case but we want to see them, always.
-	if target.Build.ImportPath == "builtin" {
-		opts.Unexported = true
-	}
 	if term.IsTerminal(int(os.Stdout.Fd())) {
-		opts.Style = style.New(detectTheme())
+		baseOpts.Style = style.New(detectTheme())
 	}
-	pkg, err := render.New(target.Build, target.UserPath, opts)
-	if err != nil {
-		return err
+
+	var resolver resolve.Resolver
+	var paths []string
+	var symbol, method string
+	// Loop until something is printed.
+	for i := 0; ; i++ {
+		target, more, err := resolver.Resolve(args)
+		if i > 0 && !more { // Ignore the "more" bit on the first iteration.
+			return failMessage(paths, symbol, method)
+		}
+		if err != nil {
+			return err
+		}
+		symbol, method = target.Symbol, target.Method
+
+		opts := baseOpts
+		// The builtin package needs special treatment: its symbols are
+		// lower case but we want to see them, always.
+		if target.Build.ImportPath == "builtin" {
+			opts.Unexported = true
+		}
+		pkg, err := render.New(target.Build, target.UserPath, opts)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, pkg.PrettyPath())
+
+		out, found, err := pkg.Render(symbol, method)
+		if err != nil {
+			return err
+		}
+		if found {
+			return pager.Write(out)
+		}
 	}
-	out, found, err := pkg.Render(target.Symbol, target.Method)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return failMessage(pkg.PrettyPath(), target.Symbol, target.Method)
-	}
-	return pager.Write(out)
 }
 
-// failMessage mirrors go doc's failMessage for a single package path.
-func failMessage(path, symbol, method string) error {
-	if method == "" {
-		return fmt.Errorf("no symbol %s in package %s", symbol, path)
+// failMessage creates a nicely formatted error message when there is no
+// result to show, mirroring go doc's failMessage.
+func failMessage(paths []string, symbol, method string) error {
+	var b strings.Builder
+	if len(paths) > 1 {
+		b.WriteString("s")
 	}
-	return fmt.Errorf("no method or field %s.%s in package %s", symbol, method, path)
+	b.WriteString(" ")
+	for i, path := range paths {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(path)
+	}
+	if method == "" {
+		return fmt.Errorf("no symbol %s in package%s", symbol, b.String())
+	}
+	return fmt.Errorf("no method or field %s.%s in package%s", symbol, method, b.String())
 }
 
 // detectTheme probes the terminal background and returns the style

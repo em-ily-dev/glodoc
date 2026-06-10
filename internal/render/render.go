@@ -684,25 +684,52 @@ func (pkg *Package) packageClause() {
 	// The import path derived from module code locations wins: if we
 	// started with a directory name, we never knew the import path, and
 	// it's cheap to (re)compute it. This mirrors go doc's module-mode
-	// scan of its code roots.
-	for _, root := range modindex.Roots() {
-		if pkg.build.Dir == root.Dir {
-			importPath = root.ImportPath
-			break
-		}
-		if strings.HasPrefix(pkg.build.Dir, root.Dir+string(filepath.Separator)) {
-			suffix := filepath.ToSlash(pkg.build.Dir[len(root.Dir)+1:])
-			if root.ImportPath == "" {
-				importPath = suffix
-			} else {
-				importPath = root.ImportPath + "/" + suffix
-			}
-			break
-		}
+	// scan of its code roots; the dependency roots, which require the
+	// module graph, are consulted only when the eager roots miss.
+	if ip, ok := importPathFor(pkg.build.Dir, modindex.Roots()); ok {
+		importPath = ip
+	} else if ip, ok := importPathFor(pkg.build.Dir, modindex.DepRoots()); ok {
+		importPath = ip
 	}
 
 	clause := fmt.Sprintf("package %s // import %q", pkg.name, importPath)
 	pkg.Printf("%s\n\n", pkg.opts.Style.clause(clause))
+}
+
+// importPathFor derives dir's import path from the first root that
+// contains it, following go doc's packageClause. A package inside a
+// vendoring root's vendor directory takes the path it is imported by,
+// matching the vendor code root go doc places ahead of its others.
+func importPathFor(dir string, roots []modindex.Root) (string, bool) {
+	for _, root := range roots {
+		if dir == root.Dir {
+			return root.ImportPath, true
+		}
+		if !strings.HasPrefix(dir, root.Dir+string(filepath.Separator)) {
+			continue
+		}
+		suffix := filepath.ToSlash(dir[len(root.Dir)+1:])
+		if rest, ok := strings.CutPrefix(suffix, "vendor/"); ok && vendoredRoot(root.Dir) {
+			return rest, true
+		}
+		if root.ImportPath == "" {
+			return suffix, true
+		}
+		return root.ImportPath + "/" + suffix, true
+	}
+	return "", false
+}
+
+// vendoredRoot reports whether the module rooted at dir vendors its
+// dependencies, in which case the dependency roots are exactly its
+// vendor directory.
+func vendoredRoot(dir string) bool {
+	for _, r := range modindex.DepRoots() {
+		if r.ImportPath == "" && r.Dir == filepath.Join(dir, "vendor") {
+			return true
+		}
+	}
+	return false
 }
 
 // valueSummary prints a one-line summary for each set of values and constants.

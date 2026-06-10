@@ -3,23 +3,23 @@
 // current module that contains Go source, and the directories of the
 // current module's dependencies.
 //
+// Entries appear in the order go doc scans its code roots — GOROOT/src,
+// GOROOT/src/cmd, the current module, then dependencies — each walked
+// breadth-first in lexical order, so a scan over the index selects the
+// same package go doc's own directory scan would.
+//
 // The standard library and current module are indexed together on first
 // use. The dependency directories, which require consulting the module
-// graph, are indexed separately and only when a lookup is not satisfied
-// by the first two; this keeps the common case—a query that names a
-// standard-library or current-module package—free of that cost. Both
-// indexes are cached for the lifetime of the process.
-//
-// The index supports package lookup by trailing path segment and
-// enumeration of the current module's packages for the TUI listing.
+// graph, are indexed separately and only on first access; this keeps
+// the common case—a lookup satisfied by the standard library or the
+// current module—free of that cost. Both indexes are cached for the
+// lifetime of the process.
 package modindex
 
 import (
 	"go/build"
-	"io/fs"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -55,6 +55,9 @@ type Index struct {
 	once    sync.Once
 	entries []Entry
 
+	depRootsOnce sync.Once
+	depRoots     []Root
+
 	depOnce    sync.Once
 	depEntries []Entry
 }
@@ -65,59 +68,22 @@ var defaultIndex = &Index{}
 // Default returns the process-wide index, building it on first access.
 func Default() *Index { return defaultIndex }
 
-// All returns every indexed entry.
+// All returns every eagerly indexed entry: the standard library and
+// the current module, in go doc's scan order. Dependency entries are
+// indexed separately; see Deps.
 func (idx *Index) All() []Entry {
 	idx.once.Do(idx.build)
 	return idx.entries
 }
 
-// FindByBase returns entries whose import path ends in name (the final
-// path segment matches). Stdlib hits are returned before module hits.
-func (idx *Index) FindByBase(name string) []Entry {
-	var matches []Entry
-	for _, e := range idx.All() {
-		if path.Base(e.ImportPath) == name {
-			matches = append(matches, e)
-		}
-	}
-	return matches
-}
-
-// FindBySuffix returns entries whose import path ends with suffix,
-// matching whole path segments. This lets a query like "internal/foo"
-// resolve to "ily.dev/glodoc/internal/foo" without ambiguity.
-func (idx *Index) FindBySuffix(suffix string) []Entry {
-	return matchSuffix(idx.All(), suffix)
-}
-
-// FindPackage returns indexed package directories whose import path is
-// name or has name as a trailing whole-segment suffix—the lookup go doc
-// performs for a bare or partial package path, such as "json" for
-// "encoding/json" or "domi/attr" for "ily.dev/domi/attr". The standard
-// library and current module are searched first; the current module's
-// dependencies are consulted, and indexed on first use, only when
-// neither yields a match. Standard-library and module hits therefore
-// take precedence over dependency hits.
-func (idx *Index) FindPackage(name string) []Entry {
-	name = path.Clean(name)
-	if ms := matchSuffix(idx.All(), name); len(ms) > 0 {
-		return ms
-	}
+// Deps returns the entries for the current module's dependencies,
+// building them on first use. The build consults the module graph
+// ("go list -m", or the vendor directory when the module vendors), so
+// callers should exhaust All before consulting Deps; lookups satisfied
+// by the standard library or current module then never pay that cost.
+func (idx *Index) Deps() []Entry {
 	idx.depOnce.Do(idx.buildDeps)
-	return matchSuffix(idx.depEntries, name)
-}
-
-// matchSuffix returns the entries whose import path is name or ends with
-// "/"+name, so that name matches only whole trailing path segments.
-func matchSuffix(entries []Entry, name string) []Entry {
-	var matches []Entry
-	suffix := "/" + name
-	for _, e := range entries {
-		if e.ImportPath == name || strings.HasSuffix(e.ImportPath, suffix) {
-			matches = append(matches, e)
-		}
-	}
-	return matches
+	return idx.depEntries
 }
 
 // Root is a code root: a directory tree of packages whose import
@@ -131,10 +97,11 @@ type Root struct {
 	ImportPath string
 }
 
-// Roots returns the code roots used to derive canonical import paths
-// from directories: GOROOT/src and the current module, in the order go
-// doc consults its own code roots. Dependency modules are not included;
-// packages found there carry their canonical import path already.
+// Roots returns the eagerly known code roots used to derive canonical
+// import paths from directories: GOROOT/src and the current module, in
+// the order go doc consults its own code roots. Dependency module
+// roots are kept separate so the common case never pays for the module
+// graph; see DepRoots.
 func Roots() []Root {
 	var roots []Root
 	if goroot := build.Default.GOROOT; goroot != "" {
@@ -144,6 +111,39 @@ func Roots() []Root {
 		roots = append(roots, Root{Dir: dir, ImportPath: mod})
 	}
 	return roots
+}
+
+// DepRoots returns the roots of the current module's dependencies,
+// consulting the module graph on first use: each module in the build
+// list with its location on disk, or the vendor directory (with an
+// empty import path, as its subdirectories already spell out import
+// paths) when the module vendors its dependencies.
+func DepRoots() []Root {
+	return defaultIndex.lazyDepRoots()
+}
+
+func (idx *Index) lazyDepRoots() []Root {
+	idx.depRootsOnce.Do(func() {
+		main, vendored := vendorEnabled()
+		if vendored {
+			if main != nil {
+				idx.depRoots = []Root{{Dir: filepath.Join(main.Dir, "vendor")}}
+			}
+			return
+		}
+		out, err := exec.Command(goCmd(), "list", "-m", "-f", "{{.Path}}\t{{.Dir}}", "all").Output()
+		if err != nil {
+			return
+		}
+		for line := range strings.SplitSeq(string(out), "\n") {
+			modPath, dir, ok := strings.Cut(line, "\t")
+			if !ok || dir == "" || (main != nil && modPath == main.Path) {
+				continue
+			}
+			idx.depRoots = append(idx.depRoots, Root{Dir: dir, ImportPath: modPath})
+		}
+	})
+	return idx.depRoots
 }
 
 // Module returns just the entries belonging to the current module.
@@ -157,10 +157,13 @@ func (idx *Index) Module() []Entry {
 	return ms
 }
 
-// build walks GOROOT/src and the current module, populating entries.
+// build walks the eager code roots, populating entries in the order go
+// doc scans its own: GOROOT/src (stopping at the cmd module boundary),
+// then GOROOT/src/cmd, then the current module.
 func (idx *Index) build() {
 	if root := build.Default.GOROOT; root != "" {
-		walk(filepath.Join(root, "src"), "", SourceStdlib, false, &idx.entries)
+		walk(filepath.Join(root, "src"), "", SourceStdlib, true, &idx.entries)
+		walk(filepath.Join(root, "src", "cmd"), "cmd", SourceStdlib, true, &idx.entries)
 	}
 	if dir, mod, ok := findModule(); ok {
 		walk(dir, mod, SourceModule, true, &idx.entries)
@@ -168,32 +171,15 @@ func (idx *Index) build() {
 }
 
 // buildDeps walks the package directories of the current module's
-// dependencies, populating depEntries. It mirrors the dependency portion
-// of go doc's findCodeRoots: when the main module vendors its
-// dependencies they are read from its vendor directory; otherwise each
-// module in the build list is located via "go list -m" and walked where
-// it sits, whether in the module cache, a workspace, or a replacement.
-// The standard library and main module are not walked here; they are
-// already indexed by build. Any failure to consult the module graph
-// leaves the dependency index empty.
+// dependency roots, populating depEntries. The standard library and
+// main module are not walked here; they are already indexed by build.
+// Any failure to consult the module graph leaves the dependency index
+// empty.
 func (idx *Index) buildDeps() {
-	main, vendored := vendorEnabled()
-	if vendored {
-		if main != nil {
-			walk(filepath.Join(main.Dir, "vendor"), "", SourceDependency, false, &idx.depEntries)
-		}
-		return
-	}
-	out, err := exec.Command(goCmd(), "list", "-m", "-f", "{{.Path}}\t{{.Dir}}", "all").Output()
-	if err != nil {
-		return
-	}
-	for line := range strings.SplitSeq(string(out), "\n") {
-		modPath, dir, ok := strings.Cut(line, "\t")
-		if !ok || dir == "" || (main != nil && modPath == main.Path) {
-			continue
-		}
-		walk(dir, modPath, SourceDependency, true, &idx.depEntries)
+	for _, root := range idx.lazyDepRoots() {
+		// The vendor root (empty import path) never holds nested
+		// module boundaries; module roots are walked with them.
+		walk(root.Dir, root.ImportPath, SourceDependency, root.ImportPath != "", &idx.depEntries)
 	}
 }
 
@@ -279,43 +265,57 @@ func goCmd() string {
 	return "go"
 }
 
-// walk recursively visits root, appending an entry for each directory
-// that contains buildable Go source. When boundary is set, the walk
-// stops at nested module boundaries: a subdirectory holding its own
-// go.mod belongs to a different module and is pruned along with its
-// subtree, so its packages are not attributed to root's module.
+// walk visits root in breadth-first lexical order, appending an entry
+// for each directory that contains buildable Go source. The order
+// matches go doc's directory scan, where the package chosen for a
+// partial path is the matching one nearest the root and lexically
+// first at its level. When boundary is set, the walk stops at nested
+// module boundaries: a subdirectory holding its own go.mod belongs to
+// a different module and is pruned along with its subtree, so its
+// packages are not attributed to root's module.
 func walk(root, importPrefix string, src Source, boundary bool, out *[]Entry) {
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || !d.IsDir() {
-			return nil
-		}
-		if p != root {
-			if skipDir(d.Name()) {
-				return fs.SkipDir
+	this := []string{}
+	next := []string{root}
+	for len(next) > 0 {
+		this, next = next, this[:0]
+		for _, dir := range this {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				continue
 			}
-			if boundary && hasGoMod(p) {
-				return fs.SkipDir
+			hasGo := false
+			for _, e := range entries {
+				name := e.Name()
+				if !e.IsDir() {
+					if strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") {
+						hasGo = true
+					}
+					continue
+				}
+				if skipDir(name) {
+					continue
+				}
+				sub := filepath.Join(dir, name)
+				if boundary && hasGoMod(sub) {
+					continue
+				}
+				next = append(next, sub)
 			}
-		}
-		if !hasGoFiles(p) {
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return nil
-		}
-		ip := importPrefix
-		if rel != "." {
-			rel = filepath.ToSlash(rel)
-			if ip == "" {
-				ip = rel
-			} else {
-				ip = ip + "/" + rel
+			if !hasGo {
+				continue
 			}
+			ip := importPrefix
+			if dir != root {
+				rel := filepath.ToSlash(dir[len(root)+1:])
+				if ip == "" {
+					ip = rel
+				} else {
+					ip = ip + "/" + rel
+				}
+			}
+			*out = append(*out, Entry{ImportPath: ip, Dir: dir, Source: src})
 		}
-		*out = append(*out, Entry{ImportPath: ip, Dir: p, Source: src})
-		return nil
-	})
+	}
 }
 
 // skipDir reports whether a directory name should be pruned from the
@@ -328,26 +328,6 @@ func skipDir(name string) bool {
 	case strings.HasPrefix(name, "."):
 		return true
 	case strings.HasPrefix(name, "_"):
-		return true
-	}
-	return false
-}
-
-// hasGoFiles reports whether dir contains at least one non-test .go
-// file. Test-only directories don't make sense as glodoc targets.
-func hasGoFiles(dir string) bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
 		return true
 	}
 	return false
