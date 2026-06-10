@@ -8,7 +8,10 @@
 // conformance suite's normalization forgives. Declarations are
 // syntax-highlighted through glamour as fenced Go code; the clause and
 // section headers take the treatment of glamour's h1 and heading
-// styles.
+// styles; within doc comments, headings echo the section-header
+// treatment, Deprecated paragraphs and BUG notes take a warning tint,
+// and pre-formatted blocks recede behind the prose. Prose body text is
+// deliberately left plain.
 package style
 
 import (
@@ -34,9 +37,15 @@ func New(theme string) render.Style {
 	header := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("39")).
 		Bold(true)
+	warn := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("214"))
+	dim := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("245"))
 	if theme == "light" {
 		cfg = styles.LightStyleConfig
 		header = header.Foreground(lipgloss.Color("27"))
+		warn = warn.Foreground(lipgloss.Color("166"))
+		dim = dim.Foreground(lipgloss.Color("240"))
 	}
 
 	// Declarations render through glamour as fenced Go code, with the
@@ -65,9 +74,38 @@ func New(theme string) render.Style {
 		return strings.Trim(out, "\n")
 	}
 
+	// prose decorates doc-comment text line by line: headings take the
+	// header treatment, Deprecated paragraphs a warning tint, and
+	// pre-formatted blocks a dimmer tone that sets them off from the
+	// surrounding text. Classification is by the indentation the
+	// comment printer used, so a wrapped list-item continuation can be
+	// mistaken for a pre-formatted block; the cost of that rare miss is
+	// a dim line, never altered text.
+	prose := func(text, prefix, codePrefix string) string {
+		lines := strings.Split(text, "\n")
+		deprecated := false
+		for i, line := range lines {
+			body := strings.TrimPrefix(line, prefix)
+			switch {
+			case strings.TrimSpace(line) == "":
+				deprecated = false
+			case strings.HasPrefix(line, codePrefix) && codePrefix != prefix:
+				lines[i] = dim.Render(line)
+			case strings.HasPrefix(body, "# "):
+				lines[i] = header.Render(line)
+			case deprecated || strings.HasPrefix(body, "Deprecated:"):
+				deprecated = true
+				lines[i] = warn.Render(line)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+
 	return render.Style{
 		Clause: func(s string) string { return clause.Render(s) },
 		Header: func(s string) string { return header.Render(s) },
 		Decl:   decl,
+		Prose:  prose,
+		Note:   func(s string) string { return warn.Render(s) },
 	}
 }

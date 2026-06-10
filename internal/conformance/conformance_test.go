@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -98,7 +99,29 @@ func TestLookupParity(t *testing.T) {
 	runTable(t, lookupTests)
 }
 
+// recordSources opens every Go source file in the module so each
+// becomes a recorded test-cache input. The suite execs a glodoc built
+// from those sources, which the cache cannot otherwise see; without
+// this, editing the renderer and re-running the suite could return a
+// stale cached pass. Two subtleties dictate the shape: the input
+// recorder is installed by m.Run, so the opens must happen inside a
+// test rather than TestMain, and only files under the module root are
+// recorded, so opening the built binary in its temporary directory
+// would not help.
+var recordSources = sync.OnceFunc(func() {
+	_ = filepath.WalkDir("../..", func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		if f, err := os.Open(p); err == nil {
+			f.Close()
+		}
+		return nil
+	})
+})
+
 func runTable(t *testing.T, table []test) {
+	recordSources()
 	for _, tc := range table {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

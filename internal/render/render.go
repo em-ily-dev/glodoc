@@ -74,11 +74,28 @@ type Style struct {
 	// Decl styles declarations: full declaration blocks as well as
 	// one-line summaries.
 	Decl func(string) string
+	// Prose styles doc-comment text rendered by ToText. It receives the
+	// prefixes the text was rendered with so it can classify lines:
+	// lines beginning with codePrefix are pre-formatted blocks, and the
+	// remainder is prose at prefix depth, where "# " introduces a
+	// heading and "Deprecated:" a deprecation notice.
+	Prose func(text, prefix, codePrefix string) string
+	// Note styles the BUG notes trailing a package view.
+	Note func(string) string
 }
 
 func (s Style) clause(text string) string { return apply(s.Clause, text) }
 func (s Style) header(text string) string { return apply(s.Header, text) }
 func (s Style) decl(text string) string   { return apply(s.Decl, text) }
+func (s Style) note(text string) string   { return apply(s.Note, text) }
+
+func (s Style) prose(text, prefix, codePrefix string) string {
+	if s.Prose == nil {
+		return text
+	}
+	body := strings.TrimRight(text, "\n")
+	return s.Prose(body, prefix, codePrefix) + text[len(body):]
+}
 
 // apply invokes f on the text minus any trailing newlines, restoring
 // them afterward, so stylers never have to reason about layout.
@@ -107,11 +124,18 @@ type Package struct {
 }
 
 func (pkg *Package) ToText(w io.Writer, text, prefix, codePrefix string) {
+	io.WriteString(w, pkg.opts.Style.prose(pkg.rawToText(text, prefix, codePrefix), prefix, codePrefix))
+}
+
+// rawToText renders a doc comment as unstyled text. It backs ToText
+// and is used directly where the rendered comment is re-emitted inside
+// a declaration (see printFieldDoc), which is styled as a whole.
+func (pkg *Package) rawToText(text, prefix, codePrefix string) string {
 	d := pkg.doc.Parser().Parse(text)
 	pr := pkg.doc.Printer()
 	pr.TextPrefix = prefix
 	pr.TextCodePrefix = codePrefix
-	w.Write(pr.Text(d))
+	return string(pr.Text(d))
 }
 
 // pkgBuffer is a wrapper for bytes.Buffer that prints a package clause the
@@ -809,7 +833,7 @@ func (pkg *Package) bugs() {
 	}
 	pkg.Printf("\n")
 	for _, note := range pkg.doc.Notes["BUG"] {
-		pkg.Printf("%s: %v\n", "BUG", note.Body)
+		pkg.Printf("%s", pkg.opts.Style.note(fmt.Sprintf("%s: %v\n", "BUG", note.Body)))
 	}
 }
 
@@ -1221,9 +1245,7 @@ func (pkg *Package) printFieldDoc(symbol, fieldName string) bool {
 				if field.Doc != nil {
 					// To present indented blocks in comments correctly, process the comment as
 					// a unit before adding the leading // to each line.
-					docBuf := new(bytes.Buffer)
-					pkg.ToText(docBuf, field.Doc.Text(), "", indent)
-					scanner := bufio.NewScanner(docBuf)
+					scanner := bufio.NewScanner(strings.NewReader(pkg.rawToText(field.Doc.Text(), "", indent)))
 					for scanner.Scan() {
 						fmt.Fprintf(&block, "%s// %s\n", indent, scanner.Bytes())
 					}
